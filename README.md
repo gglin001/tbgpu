@@ -28,13 +28,19 @@ Standalone TinyGPU / NVIDIA runtime extracted from `tinygrad`, without depending
 
 ## Run
 
-Use `PYTHONPATH` with the project root that contains the inner `tbgpu/` package:
+- install
 
 ```bash
-PYTHONPATH=. DEBUG=10 python tests/vector_add.py --kernel-input ptx
-PYTHONPATH=. DEBUG=10 python tests/vector_add.py --kernel-input cuda --launch-mode extra
-PYTHONPATH=. DEBUG=10 python tests/vector_add.py --kernel-input cuda --launch-mode kernel_params
-PYTHONPATH=. python tests/matmul.py --verify-suite
+uv pip install --system --no-build-isolation -e . -v
+```
+
+- run tests
+
+```bash
+python tests/vector_add.py --kernel-input ptx
+DEBUG=10 python tests/vector_add.py --kernel-input cuda --launch-mode extra
+DEBUG=10 python tests/vector_add.py --kernel-input cuda --launch-mode kernel_params
+python tests/matmul.py --verify-suite
 ```
 
 ## Profiling
@@ -44,7 +50,7 @@ PYTHONPATH=. python tests/matmul.py --verify-suite
 - Run the profiling demo:
 
 ```bash
-PYTHONPATH=. CUDA_PTI=1 python tests/kernel_profile.py --kernel-input ptx --iters 100
+CUDA_PTI=1 python tests/kernel_profile.py --kernel-input ptx --iters 100
 ```
 
 ## Notes
