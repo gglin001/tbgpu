@@ -36,6 +36,16 @@ PYTHONPATH=$PWD DEBUG=10 python tests/vector_add.py --kernel-input cuda --launch
 PYTHONPATH=$PWD DEBUG=10 python tests/vector_add.py --kernel-input cuda --launch-mode kernel_params
 ```
 
+## Profiling
+
+- `cuEventRecord` / `cuEventElapsedTime` now use GPU timeline timestamps, so elapsed time reflects device-side timing instead of host `perf_counter`.
+- Enable PTI-like per-kernel records with `CUDA_PTI=1` (or `tbgpu.cuda_compat.pti_enable(True)`), then read them with `tbgpu.cuda_compat.pti_collect()`.
+- Run the profiling demo:
+
+```bash
+PYTHONPATH=$PWD CUDA_PTI=1 python tests/kernel_profile.py --kernel-input ptx --iters 100
+```
+
 ## Notes
 
 - The compatibility layer only implements the subset of `cu*` APIs that the example needs.

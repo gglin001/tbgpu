@@ -156,6 +156,18 @@ class NVComputeQueue(NVCommandQueue):
     self.active_qmd = None
     return self
 
+  def timestamp(self, signal: Signal, value: int = 1):
+    self.nvm(
+      0,
+      nv_gpu.NVC56F_SEM_ADDR_LO,
+      *data64_le(signal.value_addr),
+      *data64_le(value),
+      nv_flags("NVC56F_SEM_EXECUTE", operation="release", release_wfi="en", payload_size="64bit", release_timestamp="en"),
+    )
+    self.nvm(0, nv_gpu.NVC56F_NON_STALL_INTERRUPT, 0x0)
+    self.active_qmd = None
+    return self
+
   def exec(self, prg, args_buf: Buffer, global_size: tuple[int, int, int], local_size: tuple[int, int, int]):
     qmd_buf = args_buf.offset(round_up(prg.constbufs[0][1], 1 << 8))
     qmd_buf.cpu_view().view(size=prg.qmd.mv.nbytes, fmt="B")[:] = prg.qmd.mv

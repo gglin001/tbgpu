@@ -16,6 +16,7 @@ from tbgpu.runtime.device import TBGPUDevice
 from tbgpu.runtime.program import TBGPUProgram
 
 DEBUG = int(os.getenv("DEBUG", "0"))
+CUDA_PTI = bool(os.getenv("CUDA_PTI", "0"))
 
 CUdevice = ctypes.c_int
 CUcontext = ctypes.c_void_p
@@ -97,7 +98,25 @@ class _HostAllocation:
 
 @dataclass
 class _EventState:
+  ctx_id: int | None = None
+  signal: Any | None = None
+  value: int = 0
   timestamp_ns: int = 0
+
+
+@dataclass
+class _PTIPendingKernel:
+  ctx_id: int
+  device_ordinal: int
+  kernel: str
+  grid: tuple[int, int, int]
+  block: tuple[int, int, int]
+  shared_mem_bytes: int
+  launch_index: int
+  start_signal: Any
+  end_signal: Any
+  signal_value: int = 1
+  queued_ns: int = field(default_factory=time.perf_counter_ns)
 
 
 class _RawArgsState:
@@ -115,6 +134,10 @@ _DEVICE_ALLOCS: dict[int, _DeviceAllocation] = {}
 _HOST_ALLOCS: dict[int, _HostAllocation] = {}
 _EVENTS: dict[int, _EventState] = {}
 _ERROR_BUFS: dict[int, ctypes.Array] = {}
+_PTI_PENDING: list[_PTIPendingKernel] = []
+_PTI_COMPLETED: list[dict[str, Any]] = []
+_PTI_LOCK = threading.Lock()
+_PTI_LAUNCH_COUNTER = itertools.count(1)
 
 _ENTRY_RE = re.compile(r"\.visible\s+\.entry\s+(?P<name>[\w$@.]+)\s*\((?P<params>.*?)\)\s*\{", re.S)
 _PARAM_RE = re.compile(r"\.param\s+(?:(?:\.align\s+(?P<align>\d+)\s+)?\.(?P<type>[a-z]\d+|pred)\s+(?P<name>[\w$@.]+)(?:\[(?P<count>\d+)\])?)")
@@ -136,6 +159,67 @@ _TYPE_SIZES = {
   "s64": 8,
   "f64": 8,
 }
+
+
+def _signal_timestamp_us(signal) -> float:
+  return float(signal.timestamp)
+
+
+def _queue_timestamp_event(dev, signal, value: int = 1):
+  from tbgpu.runtime.device import NVComputeQueue
+
+  NVComputeQueue().wait(dev.timeline_signal, dev.timeline_value - 1).timestamp(signal, value).signal(dev.timeline_signal, dev.next_timeline()).submit(
+    dev
+  )
+
+
+def _flush_pti(ctx_id: int | None = None):
+  ready: list[dict[str, Any]] = []
+  pending: list[_PTIPendingKernel] = []
+  for item in _PTI_PENDING:
+    if ctx_id is not None and item.ctx_id != ctx_id:
+      pending.append(item)
+      continue
+    if item.end_signal.value < item.signal_value:
+      pending.append(item)
+      continue
+    st_us = _signal_timestamp_us(item.start_signal)
+    en_us = _signal_timestamp_us(item.end_signal)
+    ready.append({
+      "ctx_id": item.ctx_id,
+      "device_ordinal": item.device_ordinal,
+      "kernel": item.kernel,
+      "grid": item.grid,
+      "block": item.block,
+      "shared_mem_bytes": item.shared_mem_bytes,
+      "launch_index": item.launch_index,
+      "queued_ns": item.queued_ns,
+      "start_us": st_us,
+      "end_us": en_us,
+      "duration_us": en_us - st_us,
+    })
+  _PTI_PENDING[:] = pending
+  _PTI_COMPLETED.extend(ready)
+
+
+def pti_enable(enabled: bool = True):
+  global CUDA_PTI
+  CUDA_PTI = bool(enabled)
+
+
+def pti_reset():
+  with _PTI_LOCK:
+    _PTI_PENDING.clear()
+    _PTI_COMPLETED.clear()
+
+
+def pti_collect(clear: bool = True) -> list[dict[str, Any]]:
+  with _PTI_LOCK:
+    _flush_pti()
+    records = [dict(item) for item in _PTI_COMPLETED]
+    if clear:
+      _PTI_COMPLETED.clear()
+    return records
 
 
 def _new_handle() -> int:
@@ -326,18 +410,40 @@ def _launch(function: _FunctionState, arg_blob: bytes, grid: tuple[int, int, int
 
   prg = _ensure_program(function)
   dev = prg.dev
+  module = _MODULES[function.module_id]
   argsbuf = dev.kernargs_buf.offset(offset=dev.kernargs_offset_allocator.alloc(prg.kernargs_alloc_size, 8), size=prg.kernargs_alloc_size)
   prefix = _build_launch_cbuf0(prg, grid, block)
   view = argsbuf.cpu_view().view(fmt="B")
   view[: len(prefix)] = prefix
   view[len(prefix) : len(prefix) + len(arg_blob)] = arg_blob
   q = NVComputeQueue().wait(dev.timeline_signal, dev.timeline_value - 1).memory_barrier()
+  prof_st = dev.new_signal() if CUDA_PTI else None
+  prof_en = dev.new_signal() if CUDA_PTI else None
+  if prof_st is not None:
+    q.timestamp(prof_st, 1)
   original_qmd = _patch_shared_mem(prg, shared_mem_bytes)
   try:
     q.exec(prg, argsbuf, grid, block)
   finally:
     _restore_shared_mem(prg, original_qmd)
+  if prof_en is not None:
+    q.timestamp(prof_en, 1)
   q.signal(dev.timeline_signal, dev.next_timeline()).submit(dev)
+  if prof_st is not None and prof_en is not None:
+    with _PTI_LOCK:
+      _PTI_PENDING.append(
+        _PTIPendingKernel(
+          ctx_id=module.ctx_id,
+          device_ordinal=_CONTEXTS[module.ctx_id].device_ordinal,
+          kernel=function.name,
+          grid=grid,
+          block=block,
+          shared_mem_bytes=shared_mem_bytes,
+          launch_index=next(_PTI_LAUNCH_COUNTER),
+          start_signal=prof_st,
+          end_signal=prof_en,
+        )
+      )
 
 
 def cuInit(flags: int) -> int:
@@ -369,6 +475,12 @@ def cuCtxDestroy_v2(ctx) -> int:
   ctx_id = _as_int(ctx)
   if ctx_id not in _CONTEXTS:
     return CUDA_ERROR_INVALID_CONTEXT
+  with _PTI_LOCK:
+    _flush_pti(ctx_id)
+    _PTI_PENDING[:] = [item for item in _PTI_PENDING if item.ctx_id != ctx_id]
+  for event in _EVENTS.values():
+    if event.ctx_id == ctx_id:
+      event.ctx_id, event.signal, event.value = None, None, 0
   if _get_current_context_id() == ctx_id:
     _set_current_context(None)
   del _CONTEXTS[ctx_id]
@@ -388,7 +500,12 @@ def cuCtxSetCurrent(context) -> int:
 
 def cuCtxSynchronize() -> int:
   try:
-    _get_ctx().nv_device.synchronize()
+    ctx_id = _get_current_context_id()
+    ctx = _get_ctx()
+    ctx.nv_device.synchronize()
+    if ctx_id is not None:
+      with _PTI_LOCK:
+        _flush_pti(ctx_id)
   except RuntimeError:
     return CUDA_ERROR_LAUNCH_FAILED
   except Exception:
@@ -555,10 +672,17 @@ def cuEventRecord(hEvent, hStream) -> int:
   if event_id not in _EVENTS:
     return CUDA_ERROR_INVALID_HANDLE
   try:
-    _get_ctx().nv_device.synchronize()
+    ctx_id = _get_current_context_id()
+    if ctx_id not in _CONTEXTS:
+      return CUDA_ERROR_INVALID_CONTEXT
+    ctx = _CONTEXTS[ctx_id]
+    signal = ctx.nv_device.new_signal()
+    _queue_timestamp_event(ctx.nv_device, signal, 1)
+  except RuntimeError:
+    return CUDA_ERROR_LAUNCH_FAILED
   except Exception:
     return CUDA_ERROR_INVALID_CONTEXT
-  _EVENTS[event_id].timestamp_ns = time.perf_counter_ns()
+  _EVENTS[event_id] = _EventState(ctx_id=ctx_id, signal=signal, value=1, timestamp_ns=time.perf_counter_ns())
   return CUDA_SUCCESS
 
 
@@ -566,6 +690,18 @@ def cuEventSynchronize(hEvent) -> int:
   event_id = _as_int(hEvent)
   if event_id not in _EVENTS:
     return CUDA_ERROR_INVALID_HANDLE
+  event = _EVENTS[event_id]
+  if event.signal is None:
+    return CUDA_SUCCESS
+  try:
+    event.signal.wait(event.value)
+    if event.ctx_id is not None:
+      with _PTI_LOCK:
+        _flush_pti(event.ctx_id)
+  except RuntimeError:
+    return CUDA_ERROR_LAUNCH_FAILED
+  except Exception:
+    return CUDA_ERROR_INVALID_CONTEXT
   return CUDA_SUCCESS
 
 
@@ -573,7 +709,18 @@ def cuEventElapsedTime(pMilliseconds, hStart, hEnd) -> int:
   st_id, en_id = _as_int(hStart), _as_int(hEnd)
   if st_id not in _EVENTS or en_id not in _EVENTS:
     return CUDA_ERROR_INVALID_HANDLE
-  pMilliseconds._obj.value = (_EVENTS[en_id].timestamp_ns - _EVENTS[st_id].timestamp_ns) / 1e6
+  st_ev, en_ev = _EVENTS[st_id], _EVENTS[en_id]
+  if st_ev.signal is not None and en_ev.signal is not None:
+    try:
+      st_ev.signal.wait(st_ev.value)
+      en_ev.signal.wait(en_ev.value)
+    except RuntimeError:
+      return CUDA_ERROR_LAUNCH_FAILED
+    except Exception:
+      return CUDA_ERROR_INVALID_CONTEXT
+    pMilliseconds._obj.value = (_signal_timestamp_us(en_ev.signal) - _signal_timestamp_us(st_ev.signal)) / 1000.0
+    return CUDA_SUCCESS
+  pMilliseconds._obj.value = (en_ev.timestamp_ns - st_ev.timestamp_ns) / 1e6
   return CUDA_SUCCESS
 
 
