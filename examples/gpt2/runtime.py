@@ -11,35 +11,24 @@ import torch
 import tbgpu.cuda_compat as cuda
 from tbgpu.compiler import compile_cuda_to_ptx
 
-MATMUL_FP32_KERNEL = "matmul_tiled_fp32"
 MATMUL_TC_KERNEL = "matmul_wmma_tf32"
 ENCODER_KERNEL = "encoder_forward"
+ENCODER_STEP_KERNEL = "encoder_forward_step"
 LAYERNORM_KERNEL = "layernorm_forward"
 FUSED_RESIDUAL_LN_KERNEL = "fused_residual_layernorm"
-GELU_KERNEL = "gelu_forward"
 ADD_KERNEL = "residual_add"
 PAD_ROWS_KERNEL = "pad_rows"
-ADD_BIAS_KERNEL = "add_bias"
-SPLIT_QKV_KERNEL = "split_qkv_heads"
-MERGE_HEADS_KERNEL = "merge_heads"
 TAKE_LAST_TOKEN_KERNEL = "take_last_token"
-FLASH_ATTN_KERNEL = "flash_attn_v2_fwd"
-FLASH_ATTN_QKV_FUSED_KERNEL = "flash_attn_qkv_fused_fwd"
+WRITE_KV_CACHE_KERNEL = "write_kv_cache"
 FLASH_ATTN_QKV_PROJ_FUSED_KERNEL = "flash_attn_qkv_proj_fused_fwd"
+FLASH_ATTN_QKV_PROJ_DECODE_KERNEL = "flash_attn_qkv_proj_decode_fwd"
 
-MATMUL_TILE = 16
 TC_BLOCK_WARPS = 4
 FLASH_BLOCK_M = 4
 FLASH_BLOCK_N = 32
 FLASH_WARP_SIZE = 32
 WARP_SIZE = 32
 WARPS_PER_BLOCK = 4
-
-_DTYPE_SIZE = {
-  torch.float32: 4,
-  torch.int32: 4,
-  torch.int64: 8,
-}
 
 
 class CUDACompatError(RuntimeError):
@@ -63,12 +52,6 @@ def _shape_numel(shape: tuple[int, ...]) -> int:
   for dim in shape:
     numel *= dim
   return numel
-
-
-def _dtype_nbytes(dtype: torch.dtype) -> int:
-  if dtype not in _DTYPE_SIZE:
-    raise ValueError(f"unsupported dtype: {dtype}")
-  return _DTYPE_SIZE[dtype]
 
 
 def _as_cpu_contiguous(tensor: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -97,7 +80,7 @@ class DeviceTensor:
 
   @property
   def nbytes(self) -> int:
-    return self.numel * _dtype_nbytes(self.dtype)
+    return self.numel * self.dtype.itemsize
 
   @property
   def matrix_rows(self) -> int:
@@ -107,25 +90,9 @@ class DeviceTensor:
   def matrix_cols(self) -> int:
     return self.shape[-1]
 
-  def reshape(self, *shape: int) -> "DeviceTensor":
-    new_shape = tuple(shape)
-    if _shape_numel(new_shape) != self.numel:
-      raise ValueError(f"reshape changes numel: {self.shape} -> {new_shape}")
-    return DeviceTensor(ptr=self.ptr, shape=new_shape, dtype=self.dtype, alloc_nbytes=self.alloc_nbytes, static=self.static)
-
-
-@dataclass(frozen=True)
-class LinearWeights:
-  weight_fp32_t: DeviceTensor | None
-  weight_tc: DeviceTensor | None
-  bias: DeviceTensor | None
-  in_features: int
-  out_features: int
-
 
 class TBGPUContext:
-  def __init__(self, device_ordinal: int = 0):
-    self.device_ordinal = device_ordinal
+  def __init__(self):
     self._closed = False
     self._modules: list[cuda.CUmodule] = []
     self._owned_ptrs: list[cuda.CUdeviceptr] = []
@@ -133,7 +100,7 @@ class TBGPUContext:
 
     _check(cuda.cuInit(0))
     self.device = cuda.CUdevice()
-    _check(cuda.cuDeviceGet(ctypes.byref(self.device), device_ordinal))
+    _check(cuda.cuDeviceGet(ctypes.byref(self.device), 0))
     self.context = cuda.CUcontext()
     _check(cuda.cuCtxCreate_v2(ctypes.byref(self.context), 0, self.device.value))
     _check(cuda.cuCtxSetCurrent(self.context))
@@ -141,26 +108,22 @@ class TBGPUContext:
     major = ctypes.c_int()
     minor = ctypes.c_int()
     _check(cuda.cuDeviceComputeCapability(ctypes.byref(major), ctypes.byref(minor), self.device.value))
-    self.compute_capability = (major.value, minor.value)
+    if (major.value, minor.value) < (8, 0):
+      raise RuntimeError(f"examples/gpt2 requires an Ampere-or-newer NVIDIA GPU, got cc={major.value}.{minor.value}")
     self.arch = f"sm_{major.value}{minor.value}"
-    self.supports_tensor_cores = self.compute_capability >= (8, 0)
 
     self._functions = {
-      MATMUL_FP32_KERNEL: self._load_kernel(_kernel_file("matmul_fp32.cu"), MATMUL_FP32_KERNEL),
-      MATMUL_TC_KERNEL: self._load_kernel(_kernel_file("matmul_tc_tf32.cu"), MATMUL_TC_KERNEL),
-      ENCODER_KERNEL: self._load_kernel(_kernel_file("encoder_forward.cu"), ENCODER_KERNEL),
-      LAYERNORM_KERNEL: self._load_kernel(_kernel_file("layernorm.cu"), LAYERNORM_KERNEL),
-      FUSED_RESIDUAL_LN_KERNEL: self._load_kernel(_kernel_file("fused_residual_layernorm.cu"), FUSED_RESIDUAL_LN_KERNEL),
-      GELU_KERNEL: self._load_kernel(_kernel_file("gelu.cu"), GELU_KERNEL),
-      ADD_KERNEL: self._load_kernel(_kernel_file("add.cu"), ADD_KERNEL),
-      PAD_ROWS_KERNEL: self._load_kernel(_kernel_file("pad_rows.cu"), PAD_ROWS_KERNEL),
-      ADD_BIAS_KERNEL: self._load_kernel(_kernel_file("add_bias.cu"), ADD_BIAS_KERNEL),
-      SPLIT_QKV_KERNEL: self._load_kernel(_kernel_file("split_qkv.cu"), SPLIT_QKV_KERNEL),
-      MERGE_HEADS_KERNEL: self._load_kernel(_kernel_file("merge_heads.cu"), MERGE_HEADS_KERNEL),
-      TAKE_LAST_TOKEN_KERNEL: self._load_kernel(_kernel_file("take_last_token.cu"), TAKE_LAST_TOKEN_KERNEL),
-      FLASH_ATTN_KERNEL: self._load_kernel(_kernel_file("flash_attn_v2.cu"), FLASH_ATTN_KERNEL),
-      FLASH_ATTN_QKV_FUSED_KERNEL: self._load_kernel(_kernel_file("attention_qkv_fused.cu"), FLASH_ATTN_QKV_FUSED_KERNEL),
-      FLASH_ATTN_QKV_PROJ_FUSED_KERNEL: self._load_kernel(_kernel_file("attention_qkv_proj_fused.cu"), FLASH_ATTN_QKV_PROJ_FUSED_KERNEL),
+      MATMUL_TC_KERNEL: self._load_kernel("matmul_tc_tf32.cu", MATMUL_TC_KERNEL),
+      ENCODER_KERNEL: self._load_kernel("encoder_forward.cu", ENCODER_KERNEL),
+      ENCODER_STEP_KERNEL: self._load_kernel("encoder_forward_step.cu", ENCODER_STEP_KERNEL),
+      LAYERNORM_KERNEL: self._load_kernel("layernorm.cu", LAYERNORM_KERNEL),
+      FUSED_RESIDUAL_LN_KERNEL: self._load_kernel("fused_residual_layernorm.cu", FUSED_RESIDUAL_LN_KERNEL),
+      ADD_KERNEL: self._load_kernel("add.cu", ADD_KERNEL),
+      PAD_ROWS_KERNEL: self._load_kernel("pad_rows.cu", PAD_ROWS_KERNEL),
+      TAKE_LAST_TOKEN_KERNEL: self._load_kernel("take_last_token.cu", TAKE_LAST_TOKEN_KERNEL),
+      WRITE_KV_CACHE_KERNEL: self._load_kernel("write_kv_cache.cu", WRITE_KV_CACHE_KERNEL),
+      FLASH_ATTN_QKV_PROJ_FUSED_KERNEL: self._load_kernel("attention_qkv_proj_fused.cu", FLASH_ATTN_QKV_PROJ_FUSED_KERNEL),
+      FLASH_ATTN_QKV_PROJ_DECODE_KERNEL: self._load_kernel("attention_qkv_proj_decode.cu", FLASH_ATTN_QKV_PROJ_DECODE_KERNEL),
     }
 
   def close(self):
@@ -188,9 +151,9 @@ class TBGPUContext:
     _check(cuda.cuCtxSetCurrent(self.context))
     _check(cuda.cuCtxSynchronize())
 
-  def _load_kernel(self, source_path: Path, kernel_name: str) -> cuda.CUfunction:
+  def _load_kernel(self, filename: str, kernel_name: str) -> cuda.CUfunction:
     _check(cuda.cuCtxSetCurrent(self.context))
-    ptx = compile_cuda_to_ptx(source_path.read_text().strip() + "\n", self.arch, kernel_name=kernel_name)
+    ptx = compile_cuda_to_ptx(_kernel_file(filename).read_text().strip() + "\n", self.arch, kernel_name=kernel_name)
     module = cuda.CUmodule()
     _check(cuda.cuModuleLoadData(ctypes.byref(module), ptx))
     function = cuda.CUfunction()
@@ -207,8 +170,25 @@ class TBGPUContext:
 
   def empty(self, shape: tuple[int, ...], dtype: torch.dtype, *, alloc_shape: tuple[int, ...] | None = None, static: bool = False) -> DeviceTensor:
     alloc = alloc_shape or shape
-    alloc_nbytes = _shape_numel(alloc) * _dtype_nbytes(dtype)
-    return DeviceTensor(ptr=self._new_ptr(alloc_nbytes), shape=shape, dtype=dtype, alloc_nbytes=alloc_nbytes, static=static)
+    return DeviceTensor(
+      ptr=self._new_ptr(_shape_numel(alloc) * dtype.itemsize),
+      shape=shape,
+      dtype=dtype,
+      alloc_nbytes=_shape_numel(alloc) * dtype.itemsize,
+      static=static,
+    )
+
+  def upload(self, tensor: torch.Tensor, *, dtype: torch.dtype | None = None, static: bool = False) -> DeviceTensor:
+    cpu = _as_cpu_contiguous(tensor, dtype=dtype)
+    out = self.empty(tuple(cpu.shape), cpu.dtype, static=static)
+    _check(cuda.cuMemcpyHtoDAsync_v2(out.ptr, cpu.data_ptr(), cpu.numel() * cpu.element_size(), None))
+    self.synchronize()
+    return out
+
+  def download(self, tensor: DeviceTensor) -> torch.Tensor:
+    out = torch.empty(tensor.shape, dtype=tensor.dtype)
+    _check(cuda.cuMemcpyDtoH_v2(out.data_ptr(), tensor.ptr, tensor.nbytes))
+    return out
 
   def free(self, tensor: DeviceTensor | None):
     if tensor is None or tensor.static:
@@ -229,45 +209,9 @@ class TBGPUContext:
       with contextlib.suppress(Exception):
         self.free(tensor)
 
-  def upload(self, tensor: torch.Tensor, *, dtype: torch.dtype | None = None, static: bool = False) -> DeviceTensor:
-    cpu = _as_cpu_contiguous(tensor, dtype=dtype)
-    out = self.empty(tuple(cpu.shape), cpu.dtype, static=static)
-    _check(cuda.cuMemcpyHtoDAsync_v2(out.ptr, cpu.data_ptr(), cpu.numel() * cpu.element_size(), None))
-    self.synchronize()
-    return out
-
-  def download(self, tensor: DeviceTensor) -> torch.Tensor:
-    out = torch.empty(tensor.shape, dtype=tensor.dtype)
-    _check(cuda.cuMemcpyDtoH_v2(out.data_ptr(), tensor.ptr, tensor.nbytes))
-    return out
-
   def _launch(self, kernel_name: str, params: list[ctypes._SimpleCData], grid: tuple[int, int, int], block: tuple[int, int, int], shared: int = 0):
     kernel_params = (ctypes.c_void_p * len(params))(*[ctypes.addressof(value) for value in params])
     _check(cuda.cuLaunchKernel(self._functions[kernel_name], *grid, *block, shared, None, kernel_params, None))
-
-  def upload_linear_weights(self, weight: torch.Tensor, bias: torch.Tensor | None, *, prefer_tensor_cores: bool = True) -> LinearWeights:
-    weight = _as_cpu_contiguous(weight, dtype=torch.float32)
-    bias_gpu = self.upload(bias, dtype=torch.float32, static=True) if bias is not None else None
-    weight_fp32_t = None
-    weight_tc = None
-
-    if prefer_tensor_cores and self.supports_tensor_cores and weight.shape[1] % 8 == 0 and weight.shape[0] % 16 == 0:
-      weight_tc = self.upload(weight, dtype=torch.float32, static=True)
-    else:
-      weight_fp32_t = self.upload(weight.t().contiguous(), dtype=torch.float32, static=True)
-
-    if weight_fp32_t is None:
-      weight_fp32_t = self.upload(weight.t().contiguous(), dtype=torch.float32, static=True)
-    if weight_tc is None and self.supports_tensor_cores and weight.shape[1] % 8 == 0 and weight.shape[0] % 16 == 0:
-      weight_tc = self.upload(weight, dtype=torch.float32, static=True)
-
-    return LinearWeights(
-      weight_fp32_t=weight_fp32_t,
-      weight_tc=weight_tc,
-      bias=bias_gpu,
-      in_features=weight.shape[1],
-      out_features=weight.shape[0],
-    )
 
   def encoder_forward(self, tokens: torch.Tensor, wte: DeviceTensor, wpe: DeviceTensor) -> DeviceTensor:
     tokens_i32 = _as_cpu_contiguous(tokens.to(dtype=torch.int32, device="cpu"))
@@ -290,28 +234,37 @@ class TBGPUContext:
     self.free(tokens_gpu)
     return out
 
+  def encoder_forward_step(self, token: int, position: int, wte: DeviceTensor, wpe: DeviceTensor) -> DeviceTensor:
+    channels = wte.shape[1]
+    out = self.empty((1, channels), torch.float32)
+    total_vec = _round_up(channels, 4) // 4
+    params = [
+      ctypes.c_uint32(int(token)),
+      ctypes.c_uint32(int(position)),
+      ctypes.c_uint64(wte.ptr.value),
+      ctypes.c_uint64(wpe.ptr.value),
+      ctypes.c_uint64(out.ptr.value),
+      ctypes.c_uint32(channels),
+    ]
+    self._launch(ENCODER_STEP_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
+    return out
+
   def layernorm(self, x: DeviceTensor, weight: DeviceTensor, bias: DeviceTensor) -> DeviceTensor:
-    rows, cols = x.matrix_rows, x.matrix_cols
     out = self.empty(x.shape, torch.float32)
     params = [
       ctypes.c_uint64(x.ptr.value),
       ctypes.c_uint64(weight.ptr.value),
       ctypes.c_uint64(bias.ptr.value),
       ctypes.c_uint64(out.ptr.value),
-      ctypes.c_uint32(rows),
-      ctypes.c_uint32(cols),
+      ctypes.c_uint32(x.matrix_rows),
+      ctypes.c_uint32(x.matrix_cols),
     ]
-    self._launch(LAYERNORM_KERNEL, params, (((rows + WARPS_PER_BLOCK - 1) // WARPS_PER_BLOCK), 1, 1), (WARP_SIZE, WARPS_PER_BLOCK, 1))
+    self._launch(LAYERNORM_KERNEL, params, (((x.matrix_rows + WARPS_PER_BLOCK - 1) // WARPS_PER_BLOCK), 1, 1), (WARP_SIZE, WARPS_PER_BLOCK, 1))
     return out
 
   def fused_residual_layernorm(
-    self,
-    residual_in: DeviceTensor,
-    update: DeviceTensor,
-    weight: DeviceTensor,
-    bias: DeviceTensor,
+    self, residual_in: DeviceTensor, update: DeviceTensor, weight: DeviceTensor, bias: DeviceTensor
   ) -> tuple[DeviceTensor, DeviceTensor]:
-    rows, cols = residual_in.matrix_rows, residual_in.matrix_cols
     residual_out = self.empty(residual_in.shape, torch.float32)
     norm_out = self.empty(residual_in.shape, torch.float32)
     params = [
@@ -321,79 +274,33 @@ class TBGPUContext:
       ctypes.c_uint64(bias.ptr.value),
       ctypes.c_uint64(residual_out.ptr.value),
       ctypes.c_uint64(norm_out.ptr.value),
-      ctypes.c_uint32(rows),
-      ctypes.c_uint32(cols),
+      ctypes.c_uint32(residual_in.matrix_rows),
+      ctypes.c_uint32(residual_in.matrix_cols),
     ]
     self._launch(
       FUSED_RESIDUAL_LN_KERNEL,
       params,
-      (((rows + WARPS_PER_BLOCK - 1) // WARPS_PER_BLOCK), 1, 1),
+      (((residual_in.matrix_rows + WARPS_PER_BLOCK - 1) // WARPS_PER_BLOCK), 1, 1),
       (WARP_SIZE, WARPS_PER_BLOCK, 1),
     )
     return residual_out, norm_out
 
   def residual_add(self, a: DeviceTensor, b: DeviceTensor) -> DeviceTensor:
     out = self.empty(a.shape, torch.float32)
+    total_vec = _round_up(a.numel, 4) // 4
     params = [
       ctypes.c_uint64(a.ptr.value),
       ctypes.c_uint64(b.ptr.value),
       ctypes.c_uint64(out.ptr.value),
       ctypes.c_uint32(a.numel),
     ]
-    self._launch(ADD_KERNEL, params, ((_round_up(a.numel, 4) // 4 + 255) // 256, 1, 1), (256, 1, 1))
-    return out
-
-  def gelu(self, x: DeviceTensor) -> DeviceTensor:
-    out = self.empty(x.shape, torch.float32)
-    params = [
-      ctypes.c_uint64(x.ptr.value),
-      ctypes.c_uint64(out.ptr.value),
-      ctypes.c_uint32(x.numel),
-    ]
-    self._launch(GELU_KERNEL, params, ((_round_up(x.numel, 4) // 4 + 255) // 256, 1, 1), (256, 1, 1))
-    return out
-
-  def split_qkv_heads(self, qkv: DeviceTensor, *, batch_size: int, seq_len: int, num_heads: int) -> tuple[DeviceTensor, DeviceTensor, DeviceTensor]:
-    channels = qkv.shape[-1] // 3
-    head_dim = channels // num_heads
-    q = self.empty((batch_size, num_heads, seq_len, head_dim), torch.float32)
-    k = self.empty((batch_size, num_heads, seq_len, head_dim), torch.float32)
-    v = self.empty((batch_size, num_heads, seq_len, head_dim), torch.float32)
-    params = [
-      ctypes.c_uint64(qkv.ptr.value),
-      ctypes.c_uint64(q.ptr.value),
-      ctypes.c_uint64(k.ptr.value),
-      ctypes.c_uint64(v.ptr.value),
-      ctypes.c_uint32(batch_size),
-      ctypes.c_uint32(seq_len),
-      ctypes.c_uint32(channels),
-      ctypes.c_uint32(head_dim),
-      ctypes.c_uint32(num_heads),
-    ]
-    total_vec = _round_up(batch_size * seq_len * channels, 4) // 4
-    self._launch(SPLIT_QKV_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
-    return q, k, v
-
-  def merge_heads(self, x: DeviceTensor, *, batch_size: int, seq_len: int, num_heads: int) -> DeviceTensor:
-    head_dim = x.shape[-1]
-    channels = num_heads * head_dim
-    out = self.empty((batch_size, seq_len, channels), torch.float32)
-    params = [
-      ctypes.c_uint64(x.ptr.value),
-      ctypes.c_uint64(out.ptr.value),
-      ctypes.c_uint32(batch_size),
-      ctypes.c_uint32(seq_len),
-      ctypes.c_uint32(channels),
-      ctypes.c_uint32(head_dim),
-      ctypes.c_uint32(num_heads),
-    ]
-    total_vec = _round_up(batch_size * seq_len * channels, 4) // 4
-    self._launch(MERGE_HEADS_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
+    self._launch(ADD_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
     return out
 
   def take_last_token(self, x: DeviceTensor, *, batch_size: int, seq_len: int) -> DeviceTensor:
     channels = x.shape[-1]
     out = self.empty((batch_size, channels), torch.float32)
+    total_vec = _round_up(batch_size * channels, 4) // 4
     params = [
       ctypes.c_uint64(x.ptr.value),
       ctypes.c_uint64(out.ptr.value),
@@ -401,115 +308,94 @@ class TBGPUContext:
       ctypes.c_uint32(seq_len),
       ctypes.c_uint32(channels),
     ]
-    total_vec = _round_up(batch_size * channels, 4) // 4
     self._launch(TAKE_LAST_TOKEN_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
     return out
 
-  def flash_attention(self, q: DeviceTensor, k: DeviceTensor, v: DeviceTensor, *, causal: bool) -> DeviceTensor:
-    batch_size, num_heads, seq_len, head_dim = q.shape
-    if head_dim > 128:
-      raise ValueError(f"flash attention head_dim must be <= 128, got {head_dim}")
-    out = self.empty(q.shape, torch.float32)
-    lse = self.empty((batch_size, num_heads, seq_len), torch.float32)
-    shared_nbytes = (2 * FLASH_BLOCK_N * head_dim + FLASH_BLOCK_M * FLASH_BLOCK_N + 3 * FLASH_BLOCK_M) * ctypes.sizeof(ctypes.c_float)
-    scale = 1.0 / math.sqrt(head_dim)
-    params = [
-      ctypes.c_uint64(q.ptr.value),
-      ctypes.c_uint64(k.ptr.value),
-      ctypes.c_uint64(v.ptr.value),
-      ctypes.c_uint64(out.ptr.value),
-      ctypes.c_uint64(lse.ptr.value),
-      ctypes.c_uint32(batch_size),
-      ctypes.c_uint32(num_heads),
-      ctypes.c_uint32(seq_len),
-      ctypes.c_uint32(head_dim),
-      ctypes.c_float(scale),
-      ctypes.c_uint32(int(causal)),
-    ]
-    self._launch(
-      FLASH_ATTN_KERNEL,
-      params,
-      ((seq_len + FLASH_BLOCK_M - 1) // FLASH_BLOCK_M, num_heads, batch_size),
-      (FLASH_WARP_SIZE, FLASH_BLOCK_M, 1),
-      shared=shared_nbytes,
-    )
-    self.defer_free(lse)
-    return out
-
-  def flash_attention_qkv_fused(self, qkv: DeviceTensor, *, batch_size: int, seq_len: int, num_heads: int, causal: bool) -> DeviceTensor:
+  def write_kv_cache(self, qkv: DeviceTensor, key_cache: DeviceTensor, value_cache: DeviceTensor, *, start_pos: int, rows: int):
     channels = qkv.shape[-1] // 3
-    head_dim = channels // num_heads
-    if head_dim > 128:
-      raise ValueError(f"flash attention head_dim must be <= 128, got {head_dim}")
-    out = self.empty((batch_size, seq_len, channels), torch.float32)
-    shared_nbytes = (2 * FLASH_BLOCK_N * head_dim + FLASH_BLOCK_M * FLASH_BLOCK_N + 3 * FLASH_BLOCK_M) * ctypes.sizeof(ctypes.c_float)
-    scale = 1.0 / math.sqrt(head_dim)
+    total_vec = _round_up(rows * channels, 4) // 4
     params = [
       ctypes.c_uint64(qkv.ptr.value),
-      ctypes.c_uint64(out.ptr.value),
-      ctypes.c_uint32(batch_size),
-      ctypes.c_uint32(num_heads),
-      ctypes.c_uint32(seq_len),
-      ctypes.c_uint32(head_dim),
-      ctypes.c_float(scale),
-      ctypes.c_uint32(int(causal)),
+      ctypes.c_uint64(key_cache.ptr.value),
+      ctypes.c_uint64(value_cache.ptr.value),
+      ctypes.c_uint32(rows),
+      ctypes.c_uint32(channels),
+      ctypes.c_uint32(start_pos),
     ]
-    self._launch(
-      FLASH_ATTN_QKV_FUSED_KERNEL,
-      params,
-      ((seq_len + FLASH_BLOCK_M - 1) // FLASH_BLOCK_M, num_heads, batch_size),
-      (FLASH_WARP_SIZE, FLASH_BLOCK_M, 1),
-      shared=shared_nbytes,
-    )
-    return out
+    self._launch(WRITE_KV_CACHE_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
 
   def flash_attention_qkv_proj_fused(
     self,
     qkv: DeviceTensor,
-    proj: LinearWeights,
+    proj_weight_t: DeviceTensor,
+    proj_bias: DeviceTensor,
     *,
     batch_size: int,
     seq_len: int,
-    num_heads: int,
-    causal: bool,
   ) -> DeviceTensor:
     channels = qkv.shape[-1] // 3
-    head_dim = channels // num_heads
-    if head_dim > 128:
-      raise ValueError(f"flash attention head_dim must be <= 128, got {head_dim}")
-    if proj.weight_fp32_t is None:
-      raise ValueError("flash attention qkv+proj fused path requires fp32 transposed proj weights")
+    head_dim = channels // 12
     out = self.empty((batch_size, seq_len, channels), torch.float32)
     shared_floats = 2 * FLASH_BLOCK_N * head_dim + FLASH_BLOCK_M * FLASH_BLOCK_N + 4 * FLASH_BLOCK_M + FLASH_BLOCK_M * head_dim
-    shared_nbytes = shared_floats * ctypes.sizeof(ctypes.c_float)
-    scale = 1.0 / math.sqrt(head_dim)
     params = [
       ctypes.c_uint64(qkv.ptr.value),
-      ctypes.c_uint64(proj.weight_fp32_t.ptr.value),
-      ctypes.c_uint64(0 if proj.bias is None else proj.bias.ptr.value),
+      ctypes.c_uint64(proj_weight_t.ptr.value),
+      ctypes.c_uint64(proj_bias.ptr.value),
       ctypes.c_uint64(out.ptr.value),
       ctypes.c_uint32(batch_size),
-      ctypes.c_uint32(num_heads),
+      ctypes.c_uint32(12),
       ctypes.c_uint32(seq_len),
       ctypes.c_uint32(head_dim),
-      ctypes.c_float(scale),
-      ctypes.c_uint32(int(causal)),
+      ctypes.c_float(1.0 / math.sqrt(head_dim)),
+      ctypes.c_uint32(1),
     ]
     self._launch(
       FLASH_ATTN_QKV_PROJ_FUSED_KERNEL,
       params,
-      (
-        (seq_len + FLASH_BLOCK_M - 1) // FLASH_BLOCK_M,
-        (channels + WARP_SIZE - 1) // WARP_SIZE,
-        batch_size,
-      ),
+      ((seq_len + FLASH_BLOCK_M - 1) // FLASH_BLOCK_M, (channels + WARP_SIZE - 1) // WARP_SIZE, batch_size),
       (FLASH_WARP_SIZE, FLASH_BLOCK_M, 1),
-      shared=shared_nbytes,
+      shared=shared_floats * ctypes.sizeof(ctypes.c_float),
+    )
+    return out
+
+  def flash_attention_qkv_proj_decode(
+    self,
+    qkv: DeviceTensor,
+    proj_weight_t: DeviceTensor,
+    proj_bias: DeviceTensor,
+    key_cache: DeviceTensor,
+    value_cache: DeviceTensor,
+    *,
+    cache_len: int,
+  ) -> DeviceTensor:
+    channels = qkv.shape[-1] // 3
+    head_dim = channels // 12
+    out = self.empty((1, channels), torch.float32)
+    shared_floats = 12 * FLASH_BLOCK_N + 3 * 12 + 12 * WARP_SIZE + 12 * head_dim
+    params = [
+      ctypes.c_uint64(qkv.ptr.value),
+      ctypes.c_uint64(proj_weight_t.ptr.value),
+      ctypes.c_uint64(proj_bias.ptr.value),
+      ctypes.c_uint64(key_cache.ptr.value),
+      ctypes.c_uint64(value_cache.ptr.value),
+      ctypes.c_uint64(out.ptr.value),
+      ctypes.c_uint32(12),
+      ctypes.c_uint32(cache_len),
+      ctypes.c_uint32(head_dim),
+      ctypes.c_float(1.0 / math.sqrt(head_dim)),
+    ]
+    self._launch(
+      FLASH_ATTN_QKV_PROJ_DECODE_KERNEL,
+      params,
+      ((channels + WARP_SIZE - 1) // WARP_SIZE, 1, 1),
+      (FLASH_WARP_SIZE, 12, 1),
+      shared=shared_floats * ctypes.sizeof(ctypes.c_float),
     )
     return out
 
   def _pad_rows(self, x: DeviceTensor, padded_rows: int) -> DeviceTensor:
     out = self.empty((x.matrix_rows, x.matrix_cols), torch.float32, alloc_shape=(padded_rows, x.matrix_cols))
+    total_vec = _round_up(padded_rows * x.matrix_cols, 4) // 4
     params = [
       ctypes.c_uint64(x.ptr.value),
       ctypes.c_uint64(out.ptr.value),
@@ -517,77 +403,29 @@ class TBGPUContext:
       ctypes.c_uint32(padded_rows),
       ctypes.c_uint32(x.matrix_cols),
     ]
-    total_vec = _round_up(padded_rows * x.matrix_cols, 4) // 4
     self._launch(PAD_ROWS_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
     return out
 
-  def _add_bias(self, x: DeviceTensor, bias: DeviceTensor):
-    rows, cols = x.matrix_rows, x.matrix_cols
+  def matmul_tc(self, x: DeviceTensor, weight: DeviceTensor, bias: DeviceTensor | None, *, gelu: bool = False) -> DeviceTensor:
+    padded_rows = _round_up(x.matrix_rows, 16)
+    a_padded = self._pad_rows(x, padded_rows) if padded_rows != x.matrix_rows else x
+    out = self.empty((*x.shape[:-1], weight.shape[0]), torch.float32, alloc_shape=(padded_rows, weight.shape[0]))
     params = [
-      ctypes.c_uint64(x.ptr.value),
-      ctypes.c_uint64(bias.ptr.value),
-      ctypes.c_uint32(rows),
-      ctypes.c_uint32(cols),
-    ]
-    total_vec = _round_up(rows * cols, 4) // 4
-    self._launch(ADD_BIAS_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
-
-  def matmul_fp32(self, x: DeviceTensor, weight_t: DeviceTensor, bias: DeviceTensor | None = None, *, gelu: bool = False) -> DeviceTensor:
-    rows = x.matrix_rows
-    out_features = weight_t.shape[1]
-    in_features = weight_t.shape[0]
-    out = self.empty((*x.shape[:-1], out_features), torch.float32)
-    params = [
-      ctypes.c_uint64(x.ptr.value),
-      ctypes.c_uint64(weight_t.ptr.value),
+      ctypes.c_uint64(a_padded.ptr.value),
+      ctypes.c_uint64(weight.ptr.value),
       ctypes.c_uint64(0 if bias is None else bias.ptr.value),
       ctypes.c_uint64(out.ptr.value),
-      ctypes.c_uint32(rows),
-      ctypes.c_uint32(out_features),
-      ctypes.c_uint32(in_features),
+      ctypes.c_uint32(padded_rows),
+      ctypes.c_uint32(weight.shape[0]),
+      ctypes.c_uint32(weight.shape[1]),
       ctypes.c_uint32(int(gelu)),
     ]
-    grid = (
-      (out_features + MATMUL_TILE - 1) // MATMUL_TILE,
-      (rows + MATMUL_TILE - 1) // MATMUL_TILE,
-      1,
+    self._launch(
+      MATMUL_TC_KERNEL,
+      params,
+      (padded_rows // 16, (weight.shape[0] + 16 * TC_BLOCK_WARPS - 1) // (16 * TC_BLOCK_WARPS), 1),
+      (32, TC_BLOCK_WARPS, 1),
     )
-    self._launch(MATMUL_FP32_KERNEL, params, grid, (MATMUL_TILE, MATMUL_TILE, 1))
+    if a_padded is not x:
+      self.defer_free(a_padded)
     return out
-
-  def matmul_linear(self, x: DeviceTensor, params: LinearWeights, *, prefer_tensor_cores: bool = True, gelu: bool = False) -> DeviceTensor:
-    rows = x.matrix_rows
-    if (
-      prefer_tensor_cores
-      and self.supports_tensor_cores
-      and params.weight_tc is not None
-      and params.out_features % 16 == 0
-      and params.in_features % 8 == 0
-      and (params.bias is not None or not gelu)
-    ):
-      padded_rows = _round_up(rows, 16)
-      a_padded = self._pad_rows(x, padded_rows) if padded_rows != rows else x
-      out = self.empty((*x.shape[:-1], params.out_features), torch.float32, alloc_shape=(padded_rows, params.out_features))
-      params_list = [
-        ctypes.c_uint64(a_padded.ptr.value),
-        ctypes.c_uint64(params.weight_tc.ptr.value),
-        ctypes.c_uint64(0 if params.bias is None else params.bias.ptr.value),
-        ctypes.c_uint64(out.ptr.value),
-        ctypes.c_uint32(padded_rows),
-        ctypes.c_uint32(params.out_features),
-        ctypes.c_uint32(params.in_features),
-        ctypes.c_uint32(int(gelu)),
-      ]
-      grid = (
-        padded_rows // 16,
-        (params.out_features + 16 * TC_BLOCK_WARPS - 1) // (16 * TC_BLOCK_WARPS),
-        1,
-      )
-      self._launch(MATMUL_TC_KERNEL, params_list, grid, (32, TC_BLOCK_WARPS, 1))
-      if a_padded is not x:
-        self.defer_free(a_padded)
-      return out
-
-    if params.weight_fp32_t is None:
-      raise ValueError("fp32 matmul fallback requested but weight_fp32_t is missing")
-    return self.matmul_fp32(x, params.weight_fp32_t, params.bias, gelu=gelu)
