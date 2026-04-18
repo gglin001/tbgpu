@@ -1,6 +1,7 @@
 exclude: |
   (?x)(
     .vscode/(.)* |
+    tbgpu/tinygpu/ |
     LICENSE
   )
 repos:
