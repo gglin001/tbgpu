@@ -14,7 +14,6 @@ Standalone TinyGPU / NVIDIA runtime extracted from `tinygrad`, without depending
 - `tbgpu/`: Python package root.
 - `tbgpu/cuda_compat.py`: minimal CUDA Driver compatibility layer used by the example.
 - `tbgpu/compiler.py`: `nvcc` helpers for `CUDA C -> PTX` and `PTX -> cubin`.
-- `tbgpu/nv_backend.py`: thin boundary exposing `open_device` and `load_program`.
 - `tbgpu/runtime/transport.py`: TinyGPU remote PCI transport for macOS.
 - `tbgpu/runtime/nv/`: vendored low-level NVIDIA bring-up pieces.
 - `tbgpu/runtime/device.py`: slim queue, allocator, signal, and device runtime.

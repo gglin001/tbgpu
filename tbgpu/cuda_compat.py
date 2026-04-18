@@ -13,8 +13,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from tbgpu import nv_backend
 from tbgpu.compiler import compile_ptx_to_cubin
+from tbgpu.runtime.device import TBGPUDevice
+from tbgpu.runtime.program import TBGPUProgram
 
 DEBUG = int(os.getenv("DEBUG", "0"))
 
@@ -154,7 +155,7 @@ def _get_ctx(ctx=None) -> _ContextState:
 
 def _get_nv_device(ordinal: int):
   if ordinal not in _NV_DEVICE_CACHE:
-    _NV_DEVICE_CACHE[ordinal] = nv_backend.open_device(ordinal)
+    _NV_DEVICE_CACHE[ordinal] = TBGPUDevice(ordinal)
   return _NV_DEVICE_CACHE[ordinal]
 
 
@@ -296,7 +297,7 @@ def _compile_ptx_to_cubin(ptx: bytes, arch: str) -> bytes:
 def _ensure_program(function: _FunctionState):
   if function.program is None:
     module = _MODULES[function.module_id]
-    function.program = nv_backend.load_program(_CONTEXTS[module.ctx_id].nv_device, function.name, module.program_image)
+    function.program = TBGPUProgram(_CONTEXTS[module.ctx_id].nv_device, function.name, module.program_image)
   return function.program
 
 
@@ -569,4 +570,3 @@ def cuGetErrorString(error: int, pStr) -> int:
     _ERROR_BUFS[error] = ctypes.create_string_buffer(_ERROR_NAMES.get(error, "Unknown CUDA error").encode())
   ctypes.cast(pStr, ctypes.POINTER(ctypes.POINTER(ctypes.c_char)))[0] = ctypes.cast(_ERROR_BUFS[error], ctypes.POINTER(ctypes.c_char))
   return CUDA_SUCCESS
-
