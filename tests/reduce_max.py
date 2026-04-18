@@ -4,6 +4,7 @@ import argparse
 import array
 import ctypes
 import struct
+from pathlib import Path
 
 import tbgpu.cuda_compat as cuda
 from tbgpu.compiler import compile_cuda_to_ptx
@@ -11,49 +12,6 @@ from tbgpu.compiler import compile_cuda_to_ptx
 KERNEL_NAME = "reduce_max"
 ITEMS_PER_THREAD = 4
 DEFAULT_MAX_BLOCKS = 1024
-
-REDUCE_MAX_CUDA = f"""
-#include <float.h>
-#include <math.h>
-
-__device__ __forceinline__ float warp_reduce_max(float val) {{
-  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {{
-    val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
-  }}
-  return val;
-}}
-
-extern "C" __global__ void reduce_max(const float *__restrict__ inp, float *__restrict__ out, unsigned int n) {{
-  extern __shared__ float shared[];
-  unsigned int tid = threadIdx.x;
-  unsigned int i = blockIdx.x * blockDim.x * {ITEMS_PER_THREAD} + tid;
-  unsigned int grid_stride = gridDim.x * blockDim.x * {ITEMS_PER_THREAD};
-  float local_max = -FLT_MAX;
-
-  while (i < n) {{
-    local_max = fmaxf(local_max, inp[i]);
-    if (i + blockDim.x < n) local_max = fmaxf(local_max, inp[i + blockDim.x]);
-    if (i + 2 * blockDim.x < n) local_max = fmaxf(local_max, inp[i + 2 * blockDim.x]);
-    if (i + 3 * blockDim.x < n) local_max = fmaxf(local_max, inp[i + 3 * blockDim.x]);
-    i += grid_stride;
-  }}
-
-  shared[tid] = local_max;
-  __syncthreads();
-
-  for (unsigned int s = blockDim.x >> 1; s > 32; s >>= 1) {{
-    if (tid < s) shared[tid] = fmaxf(shared[tid], shared[tid + s]);
-    __syncthreads();
-  }}
-
-  float block_max = shared[tid];
-  if (tid < 32) {{
-    if (blockDim.x >= 64) block_max = fmaxf(block_max, shared[tid + 32]);
-    block_max = warp_reduce_max(block_max);
-    if (tid == 0) out[blockIdx.x] = block_max;
-  }}
-}}
-"""
 
 
 def init_c_var(ty, create_cb):
@@ -71,6 +29,11 @@ def _check(status: int):
 
 def _buffer_ptr(buf: array.array) -> int:
   return ctypes.addressof((ctypes.c_float * len(buf)).from_buffer(buf))
+
+
+def _kernel_source() -> str:
+  kernel_path = Path(__file__).with_name("kernels") / "reduce_max.cu"
+  return kernel_path.read_text()
 
 
 def _launch_reduce_max(func, inp, out, size: int, blocks: int, block_size: int, shared_nbytes: int):
@@ -132,7 +95,7 @@ def run_reduce_max(
   try:
     _check(cuda.cuDeviceComputeCapability(ctypes.byref(major := ctypes.c_int()), ctypes.byref(minor := ctypes.c_int()), dev.value))
     arch = f"sm_{major.value}{minor.value}"
-    kernel_image = compile_cuda_to_ptx(REDUCE_MAX_CUDA.strip() + "\n", arch, kernel_name=KERNEL_NAME)
+    kernel_image = compile_cuda_to_ptx(_kernel_source().strip() + "\n", arch, kernel_name=KERNEL_NAME)
     module = init_c_var(cuda.CUmodule, lambda x: _check(cuda.cuModuleLoadData(ctypes.byref(x), kernel_image)))
     func = init_c_var(cuda.CUfunction, lambda x: _check(cuda.cuModuleGetFunction(ctypes.byref(x), module, KERNEL_NAME.encode())))
 

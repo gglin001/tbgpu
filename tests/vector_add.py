@@ -4,60 +4,12 @@ import argparse
 import array
 import ctypes
 import struct
+from pathlib import Path
 
 import tbgpu.cuda_compat as cuda
 from tbgpu.compiler import compile_cuda_to_ptx, compile_ptx_to_cubin
 
 KERNEL_NAME = "vector_add"
-
-VECTOR_ADD_CUDA = r"""
-extern "C" __global__ void vector_add(const float *a, const float *b, float *c, unsigned int n) {
-  unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) c[idx] = a[idx] + b[idx];
-}
-"""
-
-VECTOR_ADD_PTX = r""".version VERSION
-.target TARGET
-.address_size 64
-
-.visible .entry vector_add(
-  .param .u64 a,
-  .param .u64 b,
-  .param .u64 c,
-  .param .u32 n
-)
-{
-  .reg .pred %p<2>;
-  .reg .f32 %f<4>;
-  .reg .b32 %r<6>;
-  .reg .b64 %rd<8>;
-
-  ld.param.u64 %rd1, [a];
-  ld.param.u64 %rd2, [b];
-  ld.param.u64 %rd3, [c];
-  ld.param.u32 %r1, [n];
-
-  mov.u32 %r2, %ctaid.x;
-  mov.u32 %r3, %ntid.x;
-  mov.u32 %r4, %tid.x;
-  mad.lo.s32 %r5, %r2, %r3, %r4;
-  setp.ge.u32 %p1, %r5, %r1;
-  @%p1 bra DONE;
-
-  mul.wide.u32 %rd4, %r5, 4;
-  add.s64 %rd5, %rd1, %rd4;
-  add.s64 %rd6, %rd2, %rd4;
-  add.s64 %rd7, %rd3, %rd4;
-  ld.global.f32 %f1, [%rd5];
-  ld.global.f32 %f2, [%rd6];
-  add.f32 %f3, %f1, %f2;
-  st.global.f32 [%rd7], %f3;
-
-DONE:
-  ret;
-}
-"""
 
 
 class VecAddArgs(ctypes.Structure):
@@ -80,7 +32,17 @@ def _ptx_version_for_arch(arch: str) -> str:
 
 
 def render_vector_add_ptx(arch: str) -> bytes:
-  return VECTOR_ADD_PTX.replace("TARGET", arch).replace("VERSION", _ptx_version_for_arch(arch)).encode()
+  return _ptx_source().replace("TARGET", arch).replace("VERSION", _ptx_version_for_arch(arch)).encode()
+
+
+def _kernel_source() -> str:
+  kernel_path = Path(__file__).with_name("kernels") / "vector_add.cu"
+  return kernel_path.read_text()
+
+
+def _ptx_source() -> str:
+  ptx_path = Path(__file__).with_name("kernels") / "vector_add.ptx"
+  return ptx_path.read_text()
 
 
 def _write_if_requested(path: str | None, data: bytes):
@@ -91,7 +53,7 @@ def _write_if_requested(path: str | None, data: bytes):
 
 def load_kernel_image(arch: str, kernel_input: str, emit_ptx: str | None = None, emit_cubin: str | None = None) -> bytes:
   if kernel_input == "cuda":
-    ptx = compile_cuda_to_ptx(VECTOR_ADD_CUDA.strip() + "\n", arch, kernel_name=KERNEL_NAME)
+    ptx = compile_cuda_to_ptx(_kernel_source().strip() + "\n", arch, kernel_name=KERNEL_NAME)
     _write_if_requested(emit_ptx, ptx)
     cubin = compile_ptx_to_cubin(ptx, arch)
     _write_if_requested(emit_cubin, cubin)
