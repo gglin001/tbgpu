@@ -1,0 +1,8 @@
+[submodule "third_party/open-gpu-kernel-modules"]
+	path = third_party/open-gpu-kernel-modules
+	url = git@github.com:NVIDIA/open-gpu-kernel-modules.git
+	branch = refs/tags/570.144
+[submodule "third_party/linux-firmware"]
+	path = third_party/linux-firmware
+	url = git@github.com:NVIDIA/linux-firmware.git
+	branch = nvidia-staging
