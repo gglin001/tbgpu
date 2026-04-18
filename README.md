@@ -31,9 +31,9 @@ Standalone TinyGPU / NVIDIA runtime extracted from `tinygrad`, without depending
 Use `PYTHONPATH` with the project root that contains the inner `tbgpu/` package:
 
 ```bash
-PYTHONPATH=$PWD python tests/vector_add.py --kernel-input ptx
-PYTHONPATH=$PWD python tests/vector_add.py --kernel-input cuda --launch-mode extra
-PYTHONPATH=$PWD python tests/vector_add.py --kernel-input cuda --launch-mode kernel_params
+PYTHONPATH=$PWD DEBUG=10 python tests/vector_add.py --kernel-input ptx
+PYTHONPATH=$PWD DEBUG=10 python tests/vector_add.py --kernel-input cuda --launch-mode extra
+PYTHONPATH=$PWD DEBUG=10 python tests/vector_add.py --kernel-input cuda --launch-mode kernel_params
 ```
 
 ## Notes
