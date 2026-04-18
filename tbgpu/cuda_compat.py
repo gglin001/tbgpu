@@ -5,9 +5,7 @@ import ctypes
 import functools
 import itertools
 import os
-import pathlib
 import re
-import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -120,8 +118,24 @@ _ERROR_BUFS: dict[int, ctypes.Array] = {}
 
 _ENTRY_RE = re.compile(r"\.visible\s+\.entry\s+(?P<name>[\w$@.]+)\s*\((?P<params>.*?)\)\s*\{", re.S)
 _PARAM_RE = re.compile(r"\.param\s+(?:(?:\.align\s+(?P<align>\d+)\s+)?\.(?P<type>[a-z]\d+|pred)\s+(?P<name>[\w$@.]+)(?:\[(?P<count>\d+)\])?)")
-_TYPE_SIZES = {"pred": 1, "b8": 1, "u8": 1, "s8": 1, "b16": 2, "u16": 2, "s16": 2, "f16": 2,
-               "b32": 4, "u32": 4, "s32": 4, "f32": 4, "b64": 8, "u64": 8, "s64": 8, "f64": 8}
+_TYPE_SIZES = {
+  "pred": 1,
+  "b8": 1,
+  "u8": 1,
+  "s8": 1,
+  "b16": 2,
+  "u16": 2,
+  "s16": 2,
+  "f16": 2,
+  "b32": 4,
+  "u32": 4,
+  "s32": 4,
+  "f32": 4,
+  "b64": 8,
+  "u64": 8,
+  "s64": 8,
+  "f64": 8,
+}
 
 
 def _new_handle() -> int:
@@ -256,8 +270,9 @@ def _copy_device_to_device(dst_ptr: int, src_ptr: int, size: int):
     raise RuntimeError("unknown device pointer")
   dst_alloc, dst_off = dst_info
   src_alloc, src_off = src_info
-  src_alloc.owner.allocator._transfer(dst_alloc.buf.offset(offset=dst_off, size=size), src_alloc.buf.offset(offset=src_off, size=size), size,
-                                      src_alloc.owner, dst_alloc.owner)
+  src_alloc.owner.allocator._transfer(
+    dst_alloc.buf.offset(offset=dst_off, size=size), src_alloc.buf.offset(offset=src_off, size=size), size, src_alloc.owner, dst_alloc.owner
+  )
 
 
 def _patch_shared_mem(prg, shared_mem_bytes: int) -> bytes | None:
@@ -267,11 +282,16 @@ def _patch_shared_mem(prg, shared_mem_bytes: int) -> bytes | None:
   total = round_up(prg.shmem_usage + shared_mem_bytes, 128)
   smem_cfg = min(conf * 1024 for conf in [32, 64, 100] if conf * 1024 >= total) // 4096 + 1
   if prg.qmd.ver >= 5:
-    prg.qmd.write(shared_memory_size_shifted7=total >> 7, min_sm_config_shared_mem_size=smem_cfg,
-                  target_sm_config_shared_mem_size=smem_cfg, max_sm_config_shared_mem_size=0x1A)
+    prg.qmd.write(
+      shared_memory_size_shifted7=total >> 7,
+      min_sm_config_shared_mem_size=smem_cfg,
+      target_sm_config_shared_mem_size=smem_cfg,
+      max_sm_config_shared_mem_size=0x1A,
+    )
   else:
-    prg.qmd.write(shared_memory_size=total, min_sm_config_shared_mem_size=smem_cfg,
-                  target_sm_config_shared_mem_size=smem_cfg, max_sm_config_shared_mem_size=0x1A)
+    prg.qmd.write(
+      shared_memory_size=total, min_sm_config_shared_mem_size=smem_cfg, target_sm_config_shared_mem_size=smem_cfg, max_sm_config_shared_mem_size=0x1A
+    )
   return original
 
 
@@ -303,13 +323,14 @@ def _ensure_program(function: _FunctionState):
 
 def _launch(function: _FunctionState, arg_blob: bytes, grid: tuple[int, int, int], block: tuple[int, int, int], shared_mem_bytes: int):
   from tbgpu.runtime.device import NVComputeQueue
+
   prg = _ensure_program(function)
   dev = prg.dev
   argsbuf = dev.kernargs_buf.offset(offset=dev.kernargs_offset_allocator.alloc(prg.kernargs_alloc_size, 8), size=prg.kernargs_alloc_size)
   prefix = _build_launch_cbuf0(prg, grid, block)
   view = argsbuf.cpu_view().view(fmt="B")
-  view[:len(prefix)] = prefix
-  view[len(prefix):len(prefix) + len(arg_blob)] = arg_blob
+  view[: len(prefix)] = prefix
+  view[len(prefix) : len(prefix) + len(arg_blob)] = arg_blob
   q = NVComputeQueue().wait(dev.timeline_signal, dev.timeline_value - 1).memory_barrier()
   original_qmd = _patch_shared_mem(prg, shared_mem_bytes)
   try:

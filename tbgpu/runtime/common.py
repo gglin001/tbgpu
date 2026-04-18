@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import ctypes
-import mmap
 import os
 import struct
 import time
 from dataclasses import dataclass
 
 from tbgpu.autogen import libc
-from tbgpu.helpers import OSX, from_mv, getenv, to_mv, unwrap
+from tbgpu.helpers import getenv, to_mv, unwrap
 
 MAP_FIXED = 0x10
 
@@ -48,6 +47,7 @@ class FileIOInterface:
 
   def ioctl(self, request, arg):
     import fcntl
+
     return fcntl.ioctl(self.fd, request, arg)
 
   def read(self, size=None, binary=False, offset=None):
@@ -148,4 +148,3 @@ class Signal:
         start = int(time.perf_counter() * 1000)
     if self.value < value:
       raise RuntimeError(f"wait timeout: signal={self.value}, expected>={value}")
-

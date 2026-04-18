@@ -1,0 +1,40 @@
+exclude: |
+  (?x)(
+    .vscode/(.)* |
+    LICENSE
+  )
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-xml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: requirements-txt-fixer
+      - id: mixed-line-ending
+      - id: debug-statements
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.1
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+        # args: ["--fix", "--exit-non-zero-on-fix", "--unsafe-fixes"]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: shfmt
+        name: shfmt
+        language: system
+        # entry: shfmt -i 2 -w <file>
+        entry: |
+          bash -c '
+          if ! command -v shfmt >/dev/null; then exit 0; fi
+          shfmt -i 2 -w "$@"
+          ' --
+        types: [file]
+        files: \.(sh)$

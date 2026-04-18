@@ -124,8 +124,13 @@ def _make_extra(args: VecAddArgs):
   arg_blob = _encode_args_blob(args)
   arg_buf = ctypes.create_string_buffer(arg_blob)
   arg_size = ctypes.c_size_t(len(arg_blob))
-  extra = (ctypes.c_void_p * 5)(ctypes.c_void_p(1), ctypes.cast(arg_buf, ctypes.c_void_p), ctypes.c_void_p(2),
-                                ctypes.cast(ctypes.pointer(arg_size), ctypes.c_void_p), ctypes.c_void_p(0))
+  extra = (ctypes.c_void_p * 5)(
+    ctypes.c_void_p(1),
+    ctypes.cast(arg_buf, ctypes.c_void_p),
+    ctypes.c_void_p(2),
+    ctypes.cast(ctypes.pointer(arg_size), ctypes.c_void_p),
+    ctypes.c_void_p(0),
+  )
   return extra, (arg_buf, arg_size)
 
 
@@ -135,8 +140,14 @@ def _make_kernel_params(args: VecAddArgs):
   return params, scalars
 
 
-def run_vector_add(size: int = 256, block_size: int = 64, launch_mode: str = "extra", kernel_input: str = "ptx",
-                   emit_ptx: str | None = None, emit_cubin: str | None = None):
+def run_vector_add(
+  size: int = 256,
+  block_size: int = 64,
+  launch_mode: str = "extra",
+  kernel_input: str = "ptx",
+  emit_ptx: str | None = None,
+  emit_cubin: str | None = None,
+):
   _check(cuda.cuInit(0))
   dev = init_c_var(cuda.CUdevice, lambda x: _check(cuda.cuDeviceGet(ctypes.byref(x), 0)))
   ctx = init_c_var(cuda.CUcontext, lambda x: _check(cuda.cuCtxCreate_v2(ctypes.byref(x), 0, dev.value)))
@@ -191,11 +202,16 @@ def main():
   parser.add_argument("--emit-ptx")
   parser.add_argument("--emit-cubin")
   args = parser.parse_args()
-  run_vector_add(size=args.size, block_size=args.block_size, launch_mode=args.launch_mode, kernel_input=args.kernel_input,
-                 emit_ptx=args.emit_ptx, emit_cubin=args.emit_cubin)
+  run_vector_add(
+    size=args.size,
+    block_size=args.block_size,
+    launch_mode=args.launch_mode,
+    kernel_input=args.kernel_input,
+    emit_ptx=args.emit_ptx,
+    emit_cubin=args.emit_cubin,
+  )
   print(f"vector add ok, size={args.size}, launch_mode={args.launch_mode}, kernel_input={args.kernel_input}")
 
 
 if __name__ == "__main__":
   main()
-

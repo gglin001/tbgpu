@@ -35,11 +35,11 @@ class TBGPUProgram:
             self.regs_usage = struct.unpack_from("II", data)[1]
     for apply_image_offset, rel_sym_offset, typ, _ in relocs:
       if typ == 2:
-        image[apply_image_offset:apply_image_offset + 8] = struct.pack("<Q", self.lib_gpu.va_addr + rel_sym_offset)
+        image[apply_image_offset : apply_image_offset + 8] = struct.pack("<Q", self.lib_gpu.va_addr + rel_sym_offset)
       elif typ == 0x38:
-        image[apply_image_offset + 4:apply_image_offset + 8] = struct.pack("<I", (self.lib_gpu.va_addr + rel_sym_offset) & 0xFFFFFFFF)
+        image[apply_image_offset + 4 : apply_image_offset + 8] = struct.pack("<I", (self.lib_gpu.va_addr + rel_sym_offset) & 0xFFFFFFFF)
       elif typ == 0x39:
-        image[apply_image_offset + 4:apply_image_offset + 8] = struct.pack("<I", (self.lib_gpu.va_addr + rel_sym_offset) >> 32)
+        image[apply_image_offset + 4 : apply_image_offset + 8] = struct.pack("<I", (self.lib_gpu.va_addr + rel_sym_offset) >> 32)
       else:
         raise RuntimeError(f"unknown NV reloc {typ}")
     min_cbuf0_entries = 224 if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A else 12
@@ -49,22 +49,49 @@ class TBGPUProgram:
     self.dev.synchronize()
     if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A:
       self.cbuf_0[188:192], self.cbuf_0[223] = [*data64_le(self.dev.shared_mem_window), *data64_le(self.dev.local_mem_window)], 0xFFFDC0
-      qmd = {"qmd_major_version": 5, "qmd_type": nv_gpu.NVCEC0_QMDV05_00_QMD_TYPE_GRID_CTA,
-             "program_address_upper_shifted4": hi32(prog_addr >> 4), "program_address_lower_shifted4": lo32(prog_addr >> 4),
-             "register_count": self.regs_usage, "shared_memory_size_shifted7": self.shmem_usage >> 7,
-             "shader_local_memory_high_size_shifted4": self.dev.slm_per_thread >> 4, "sass_version": dev.sass_version}
+      qmd = {
+        "qmd_major_version": 5,
+        "qmd_type": nv_gpu.NVCEC0_QMDV05_00_QMD_TYPE_GRID_CTA,
+        "program_address_upper_shifted4": hi32(prog_addr >> 4),
+        "program_address_lower_shifted4": lo32(prog_addr >> 4),
+        "register_count": self.regs_usage,
+        "shared_memory_size_shifted7": self.shmem_usage >> 7,
+        "shader_local_memory_high_size_shifted4": self.dev.slm_per_thread >> 4,
+        "sass_version": dev.sass_version,
+      }
     else:
       self.cbuf_0[6:12] = [*data64_le(self.dev.shared_mem_window), *data64_le(self.dev.local_mem_window), *data64_le(0xFFFDC0)]
-      qmd = {"qmd_major_version": 3, "sm_global_caching_enable": 1, "program_address_upper": hi32(prog_addr), "program_address_lower": lo32(prog_addr),
-             "shared_memory_size": self.shmem_usage, "register_count_v": self.regs_usage, "shader_local_memory_high_size": self.dev.slm_per_thread,
-             "sass_version": dev.sass_version}
+      qmd = {
+        "qmd_major_version": 3,
+        "sm_global_caching_enable": 1,
+        "program_address_upper": hi32(prog_addr),
+        "program_address_lower": lo32(prog_addr),
+        "shared_memory_size": self.shmem_usage,
+        "register_count_v": self.regs_usage,
+        "shader_local_memory_high_size": self.dev.slm_per_thread,
+        "sass_version": dev.sass_version,
+      }
     smem_cfg = min(shmem_conf * 1024 for shmem_conf in [32, 64, 100] if shmem_conf * 1024 >= self.shmem_usage) // 4096 + 1
-    self.qmd = QMD(dev, **qmd, qmd_group_id=0x3F, invalidate_texture_header_cache=1, invalidate_texture_sampler_cache=1,
-                   invalidate_texture_data_cache=1, invalidate_shader_data_cache=1, api_visible_call_limit=1, sampler_index=1, barrier_count=1,
-                   cwd_membar_type=nv_gpu.NVC6C0_QMDV03_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR, constant_buffer_invalidate_0=1,
-                   min_sm_config_shared_mem_size=smem_cfg, target_sm_config_shared_mem_size=smem_cfg, max_sm_config_shared_mem_size=0x1A,
-                   program_prefetch_size=min(prog_sz >> 8, 0x1FF), program_prefetch_addr_upper_shifted=prog_addr >> 40,
-                   program_prefetch_addr_lower_shifted=prog_addr >> 8)
+    self.qmd = QMD(
+      dev,
+      **qmd,
+      qmd_group_id=0x3F,
+      invalidate_texture_header_cache=1,
+      invalidate_texture_sampler_cache=1,
+      invalidate_texture_data_cache=1,
+      invalidate_shader_data_cache=1,
+      api_visible_call_limit=1,
+      sampler_index=1,
+      barrier_count=1,
+      cwd_membar_type=nv_gpu.NVC6C0_QMDV03_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR,
+      constant_buffer_invalidate_0=1,
+      min_sm_config_shared_mem_size=smem_cfg,
+      target_sm_config_shared_mem_size=smem_cfg,
+      max_sm_config_shared_mem_size=0x1A,
+      program_prefetch_size=min(prog_sz >> 8, 0x1FF),
+      program_prefetch_addr_upper_shifted=prog_addr >> 40,
+      program_prefetch_addr_lower_shifted=prog_addr >> 8,
+    )
     for index, (addr, size) in self.constbufs.items():
       self.qmd.set_constant_buf_addr(index, addr)
       self.qmd.write(**{f"constant_buffer_size_shifted4_{index}": size, f"constant_buffer_valid_{index}": 1})
@@ -74,6 +101,5 @@ class TBGPUProgram:
   def _parse_elf_info(self, sh, start_off=0):
     while start_off < sh.header.sh_size:
       typ, param, size = struct.unpack_from("BBH", sh.content, start_off)
-      yield typ, param, sh.content[start_off + 4:start_off + size + 4] if typ == 0x4 else size
+      yield typ, param, sh.content[start_off + 4 : start_off + size + 4] if typ == 0x4 else size
       start_off += (size if typ == 0x4 else 0) + 4
-

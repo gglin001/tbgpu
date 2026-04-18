@@ -1,2 +1,1 @@
-from . import c
-
+from . import c as c

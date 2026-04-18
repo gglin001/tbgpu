@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import atexit
 import contextlib
-import ctypes
 import enum
 import fcntl
 import functools
@@ -14,14 +12,15 @@ import struct
 import subprocess
 import time
 
-from tbgpu.helpers import DEBUG, OSX, ceildiv, getenv, temp, unwrap
-from tbgpu.runtime.common import FileIOInterface, MAP_FIXED, MMIOInterface
+from tbgpu.helpers import ceildiv, getenv, temp, unwrap
+from tbgpu.runtime.common import FileIOInterface, MMIOInterface
 
 
 class _System:
   @functools.cached_property
   def libsys(self):
     import ctypes.util
+
     return ctypes.CDLL(ctypes.util.find_library("System") or "/usr/lib/libSystem.B.dylib")
 
   def memory_barrier(self):
@@ -42,7 +41,9 @@ System = _System()
 
 
 class RemoteCmd(enum.IntEnum):
-  PROBE, MAP_BAR, MAP_SYSMEM_FD, CFG_READ, CFG_WRITE, RESET, MMIO_READ, MMIO_WRITE, MAP_SYSMEM, SYSMEM_READ, SYSMEM_WRITE, RESIZE_BAR, PING = range(13)
+  PROBE, MAP_BAR, MAP_SYSMEM_FD, CFG_READ, CFG_WRITE, RESET, MMIO_READ, MMIO_WRITE, MAP_SYSMEM, SYSMEM_READ, SYSMEM_WRITE, RESIZE_BAR, PING = range(
+    13
+  )
 
 
 class RemoteMMIOInterface(MMIOInterface):
@@ -63,7 +64,11 @@ class RemoteMMIOInterface(MMIOInterface):
 
   def __setitem__(self, index, value):
     start = (index.start or 0) * self.el_sz if isinstance(index, slice) else index * self.el_sz
-    payload = (value if self.fmt == "B" else struct.pack(f"<{len(value)}{self.fmt}", *value)) if isinstance(index, slice) else struct.pack(f"<{self.fmt}", value)
+    payload = (
+      (value if self.fmt == "B" else struct.pack(f"<{len(value)}{self.fmt}", *value))
+      if isinstance(index, slice)
+      else struct.pack(f"<{self.fmt}", value)
+    )
     self.dev._bulk_write(self.wr_cmd, self.residx, self.off + start, payload)
 
   def view(self, offset=0, size=None, fmt=None):
@@ -119,7 +124,7 @@ class RemotePCIDevice:
     mapped_size, _, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
     memview = MMIOInterface(FileIOInterface(fd=fd).mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0), mapped_size, fmt="B")
     paddrs_raw = list(itertools.takewhile(lambda pair: pair[1] != 0, zip(memview.view(fmt="Q")[0::2], memview.view(fmt="Q")[1::2])))
-    return memview, [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+    return memview, [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][: ceildiv(size, 0x1000)]
 
   def reset(self):
     self._rpc(self.sock, self.dev_id, RemoteCmd.RESET)
@@ -159,4 +164,3 @@ class APLRemotePCIDevice(RemotePCIDevice):
 
   def __init__(self, devpref: str, dev_id: int):
     super().__init__(devpref, dev_id, self.connect())
-
