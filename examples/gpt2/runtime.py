@@ -24,6 +24,8 @@ SPLIT_QKV_KERNEL = "split_qkv_heads"
 MERGE_HEADS_KERNEL = "merge_heads"
 TAKE_LAST_TOKEN_KERNEL = "take_last_token"
 FLASH_ATTN_KERNEL = "flash_attn_v2_fwd"
+FLASH_ATTN_QKV_FUSED_KERNEL = "flash_attn_qkv_fused_fwd"
+FLASH_ATTN_QKV_PROJ_FUSED_KERNEL = "flash_attn_qkv_proj_fused_fwd"
 
 MATMUL_TILE = 16
 TC_BLOCK_WARPS = 4
@@ -127,7 +129,6 @@ class TBGPUContext:
     self._closed = False
     self._modules: list[cuda.CUmodule] = []
     self._owned_ptrs: list[cuda.CUdeviceptr] = []
-    self._static_cache: dict[int, DeviceTensor] = {}
     self._deferred_free: list[DeviceTensor] = []
 
     _check(cuda.cuInit(0))
@@ -158,6 +159,8 @@ class TBGPUContext:
       MERGE_HEADS_KERNEL: self._load_kernel(_kernel_file("merge_heads.cu"), MERGE_HEADS_KERNEL),
       TAKE_LAST_TOKEN_KERNEL: self._load_kernel(_kernel_file("take_last_token.cu"), TAKE_LAST_TOKEN_KERNEL),
       FLASH_ATTN_KERNEL: self._load_kernel(_kernel_file("flash_attn_v2.cu"), FLASH_ATTN_KERNEL),
+      FLASH_ATTN_QKV_FUSED_KERNEL: self._load_kernel(_kernel_file("attention_qkv_fused.cu"), FLASH_ATTN_QKV_FUSED_KERNEL),
+      FLASH_ATTN_QKV_PROJ_FUSED_KERNEL: self._load_kernel(_kernel_file("attention_qkv_proj_fused.cu"), FLASH_ATTN_QKV_PROJ_FUSED_KERNEL),
     }
 
   def close(self):
@@ -170,7 +173,6 @@ class TBGPUContext:
       with contextlib.suppress(Exception):
         cuda.cuMemFree_v2(ptr)
     self._owned_ptrs.clear()
-    self._static_cache.clear()
     for module in self._modules:
       with contextlib.suppress(Exception):
         cuda.cuModuleUnload(module)
@@ -229,14 +231,9 @@ class TBGPUContext:
 
   def upload(self, tensor: torch.Tensor, *, dtype: torch.dtype | None = None, static: bool = False) -> DeviceTensor:
     cpu = _as_cpu_contiguous(tensor, dtype=dtype)
-    key = cpu.data_ptr()
-    if static and key in self._static_cache:
-      return self._static_cache[key]
     out = self.empty(tuple(cpu.shape), cpu.dtype, static=static)
     _check(cuda.cuMemcpyHtoDAsync_v2(out.ptr, cpu.data_ptr(), cpu.numel() * cpu.element_size(), None))
     self.synchronize()
-    if static:
-      self._static_cache[key] = out
     return out
 
   def download(self, tensor: DeviceTensor) -> torch.Tensor:
@@ -439,6 +436,78 @@ class TBGPUContext:
     self.defer_free(lse)
     return out
 
+  def flash_attention_qkv_fused(self, qkv: DeviceTensor, *, batch_size: int, seq_len: int, num_heads: int, causal: bool) -> DeviceTensor:
+    channels = qkv.shape[-1] // 3
+    head_dim = channels // num_heads
+    if head_dim > 128:
+      raise ValueError(f"flash attention head_dim must be <= 128, got {head_dim}")
+    out = self.empty((batch_size, seq_len, channels), torch.float32)
+    shared_nbytes = (2 * FLASH_BLOCK_N * head_dim + FLASH_BLOCK_M * FLASH_BLOCK_N + 3 * FLASH_BLOCK_M) * ctypes.sizeof(ctypes.c_float)
+    scale = 1.0 / math.sqrt(head_dim)
+    params = [
+      ctypes.c_uint64(qkv.ptr.value),
+      ctypes.c_uint64(out.ptr.value),
+      ctypes.c_uint32(batch_size),
+      ctypes.c_uint32(num_heads),
+      ctypes.c_uint32(seq_len),
+      ctypes.c_uint32(head_dim),
+      ctypes.c_float(scale),
+      ctypes.c_uint32(int(causal)),
+    ]
+    self._launch(
+      FLASH_ATTN_QKV_FUSED_KERNEL,
+      params,
+      ((seq_len + FLASH_BLOCK_M - 1) // FLASH_BLOCK_M, num_heads, batch_size),
+      (FLASH_WARP_SIZE, FLASH_BLOCK_M, 1),
+      shared=shared_nbytes,
+    )
+    return out
+
+  def flash_attention_qkv_proj_fused(
+    self,
+    qkv: DeviceTensor,
+    proj: LinearWeights,
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    causal: bool,
+  ) -> DeviceTensor:
+    channels = qkv.shape[-1] // 3
+    head_dim = channels // num_heads
+    if head_dim > 128:
+      raise ValueError(f"flash attention head_dim must be <= 128, got {head_dim}")
+    if proj.weight_fp32_t is None:
+      raise ValueError("flash attention qkv+proj fused path requires fp32 transposed proj weights")
+    out = self.empty((batch_size, seq_len, channels), torch.float32)
+    shared_floats = 2 * FLASH_BLOCK_N * head_dim + FLASH_BLOCK_M * FLASH_BLOCK_N + 4 * FLASH_BLOCK_M + FLASH_BLOCK_M * head_dim
+    shared_nbytes = shared_floats * ctypes.sizeof(ctypes.c_float)
+    scale = 1.0 / math.sqrt(head_dim)
+    params = [
+      ctypes.c_uint64(qkv.ptr.value),
+      ctypes.c_uint64(proj.weight_fp32_t.ptr.value),
+      ctypes.c_uint64(0 if proj.bias is None else proj.bias.ptr.value),
+      ctypes.c_uint64(out.ptr.value),
+      ctypes.c_uint32(batch_size),
+      ctypes.c_uint32(num_heads),
+      ctypes.c_uint32(seq_len),
+      ctypes.c_uint32(head_dim),
+      ctypes.c_float(scale),
+      ctypes.c_uint32(int(causal)),
+    ]
+    self._launch(
+      FLASH_ATTN_QKV_PROJ_FUSED_KERNEL,
+      params,
+      (
+        (seq_len + FLASH_BLOCK_M - 1) // FLASH_BLOCK_M,
+        (channels + WARP_SIZE - 1) // WARP_SIZE,
+        batch_size,
+      ),
+      (FLASH_WARP_SIZE, FLASH_BLOCK_M, 1),
+      shared=shared_nbytes,
+    )
+    return out
+
   def _pad_rows(self, x: DeviceTensor, padded_rows: int) -> DeviceTensor:
     out = self.empty((x.matrix_rows, x.matrix_cols), torch.float32, alloc_shape=(padded_rows, x.matrix_cols))
     params = [
@@ -463,20 +532,20 @@ class TBGPUContext:
     total_vec = _round_up(rows * cols, 4) // 4
     self._launch(ADD_BIAS_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
 
-  def matmul_fp32(self, x: DeviceTensor, weight_t: DeviceTensor, bias: DeviceTensor | None = None) -> DeviceTensor:
+  def matmul_fp32(self, x: DeviceTensor, weight_t: DeviceTensor, bias: DeviceTensor | None = None, *, gelu: bool = False) -> DeviceTensor:
     rows = x.matrix_rows
     out_features = weight_t.shape[1]
     in_features = weight_t.shape[0]
     out = self.empty((*x.shape[:-1], out_features), torch.float32)
     params = [
-      ctypes.c_uint64(out.ptr.value),
       ctypes.c_uint64(x.ptr.value),
       ctypes.c_uint64(weight_t.ptr.value),
+      ctypes.c_uint64(0 if bias is None else bias.ptr.value),
+      ctypes.c_uint64(out.ptr.value),
       ctypes.c_uint32(rows),
       ctypes.c_uint32(out_features),
       ctypes.c_uint32(in_features),
-      ctypes.c_float(1.0),
-      ctypes.c_float(0.0),
+      ctypes.c_uint32(int(gelu)),
     ]
     grid = (
       (out_features + MATMUL_TILE - 1) // MATMUL_TILE,
@@ -484,11 +553,9 @@ class TBGPUContext:
       1,
     )
     self._launch(MATMUL_FP32_KERNEL, params, grid, (MATMUL_TILE, MATMUL_TILE, 1))
-    if bias is not None:
-      self._add_bias(out, bias)
     return out
 
-  def matmul_linear(self, x: DeviceTensor, params: LinearWeights, *, prefer_tensor_cores: bool = True) -> DeviceTensor:
+  def matmul_linear(self, x: DeviceTensor, params: LinearWeights, *, prefer_tensor_cores: bool = True, gelu: bool = False) -> DeviceTensor:
     rows = x.matrix_rows
     if (
       prefer_tensor_cores
@@ -496,6 +563,7 @@ class TBGPUContext:
       and params.weight_tc is not None
       and params.out_features % 16 == 0
       and params.in_features % 8 == 0
+      and (params.bias is not None or not gelu)
     ):
       padded_rows = _round_up(rows, 16)
       a_padded = self._pad_rows(x, padded_rows) if padded_rows != rows else x
@@ -503,10 +571,12 @@ class TBGPUContext:
       params_list = [
         ctypes.c_uint64(a_padded.ptr.value),
         ctypes.c_uint64(params.weight_tc.ptr.value),
+        ctypes.c_uint64(0 if params.bias is None else params.bias.ptr.value),
         ctypes.c_uint64(out.ptr.value),
         ctypes.c_uint32(padded_rows),
         ctypes.c_uint32(params.out_features),
         ctypes.c_uint32(params.in_features),
+        ctypes.c_uint32(int(gelu)),
       ]
       grid = (
         padded_rows // 16,
@@ -514,12 +584,10 @@ class TBGPUContext:
         1,
       )
       self._launch(MATMUL_TC_KERNEL, params_list, grid, (32, TC_BLOCK_WARPS, 1))
-      if params.bias is not None:
-        self._add_bias(out, params.bias)
       if a_padded is not x:
         self.defer_free(a_padded)
       return out
 
     if params.weight_fp32_t is None:
       raise ValueError("fp32 matmul fallback requested but weight_fp32_t is missing")
-    return self.matmul_fp32(x, params.weight_fp32_t, params.bias)
+    return self.matmul_fp32(x, params.weight_fp32_t, params.bias, gelu=gelu)

@@ -1,14 +1,16 @@
+#include <math.h>
+
 #define TILE 16
 
 extern "C" __global__ void matmul_tiled_fp32(
-  float *__restrict__ c,
   const float *__restrict__ a,
   const float *__restrict__ b,
+  const float *__restrict__ bias,
+  float *__restrict__ c,
   unsigned int m,
   unsigned int n,
   unsigned int k,
-  float alpha,
-  float beta
+  unsigned int epilogue
 ) {
   __shared__ float a_tile[TILE][TILE];
   __shared__ float b_tile[TILE][TILE];
@@ -34,6 +36,12 @@ extern "C" __global__ void matmul_tiled_fp32(
 
   if (row < m && col < n) {
     const unsigned int idx = row * n + col;
-    c[idx] = alpha * acc + beta * c[idx];
+    float value = acc;
+    if (bias != nullptr) value += bias[col];
+    if (epilogue == 1) {
+      const float cube = 0.044715f * value * value * value;
+      value = 0.5f * value * (1.0f + tanhf(0.7978845608028654f * (value + cube)));
+    }
+    c[idx] = value;
   }
 }

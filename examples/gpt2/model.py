@@ -90,6 +90,10 @@ MODEL_CONFIGS = {
 }
 
 
+def _round_up(value: int, alignment: int) -> int:
+  return ((value + alignment - 1) // alignment) * alignment
+
+
 class GPT(nn.Module):
   def __init__(self, config: GPTConfig):
     super().__init__()
@@ -248,7 +252,14 @@ class TBGPUGPT:
     self.wpe = self.runtime.upload(model.transformer.wpe.weight.detach().to(dtype=torch.float32, device="cpu"), static=True)
     self.ln_f_weight = self.runtime.upload(model.transformer.ln_f.weight.detach().to(dtype=torch.float32, device="cpu"), static=True)
     self.ln_f_bias = self.runtime.upload(model.transformer.ln_f.bias.detach().to(dtype=torch.float32, device="cpu"), static=True)
-    self.lm_head = self.runtime.upload_linear_weights(model.lm_head.weight, None, prefer_tensor_cores=False)
+    self.lm_head_vocab_size = model.lm_head.weight.shape[0]
+    self.lm_head_padded_vocab_size = _round_up(self.lm_head_vocab_size, 16)
+    lm_head_weight = model.lm_head.weight.detach().to(dtype=torch.float32, device="cpu").contiguous()
+    if self.lm_head_padded_vocab_size != self.lm_head_vocab_size:
+      padded = torch.zeros((self.lm_head_padded_vocab_size, lm_head_weight.shape[1]), dtype=lm_head_weight.dtype)
+      padded[: self.lm_head_vocab_size] = lm_head_weight
+      lm_head_weight = padded
+    self.lm_head = self.runtime.upload_linear_weights(lm_head_weight, None, prefer_tensor_cores=True)
 
     self.blocks = []
     for block in model.transformer.h:
@@ -291,29 +302,24 @@ class TBGPUGPT:
       for block_index, block in enumerate(self.blocks):
         qkv = self.runtime.matmul_linear(ln_1, block.attn_qkv, prefer_tensor_cores=True)
         self.runtime.defer_free(ln_1)
-        q, k, v = self.runtime.split_qkv_heads(qkv, batch_size=batch_size, seq_len=seq_len, num_heads=block.num_heads)
+        attn_proj = self.runtime.flash_attention_qkv_proj_fused(
+          qkv,
+          block.attn_proj,
+          batch_size=batch_size,
+          seq_len=seq_len,
+          num_heads=block.num_heads,
+          causal=True,
+        )
         self.runtime.defer_free(qkv)
-
-        attn = self.runtime.flash_attention(q, k, v, causal=True)
-        self.runtime.defer_free(q)
-        self.runtime.defer_free(k)
-        self.runtime.defer_free(v)
-
-        attn_merged = self.runtime.merge_heads(attn, batch_size=batch_size, seq_len=seq_len, num_heads=block.num_heads)
-        self.runtime.defer_free(attn)
-        attn_proj = self.runtime.matmul_linear(attn_merged, block.attn_proj, prefer_tensor_cores=True)
-        self.runtime.defer_free(attn_merged)
 
         residual_1, ln_2 = self.runtime.fused_residual_layernorm(x, attn_proj, block.ln_2_weight, block.ln_2_bias)
         self.runtime.defer_free(x)
         self.runtime.defer_free(attn_proj)
 
-        mlp_hidden = self.runtime.matmul_linear(ln_2, block.mlp_fc, prefer_tensor_cores=True)
+        mlp_hidden = self.runtime.matmul_linear(ln_2, block.mlp_fc, prefer_tensor_cores=True, gelu=True)
         self.runtime.defer_free(ln_2)
-        mlp_act = self.runtime.gelu(mlp_hidden)
+        mlp_proj = self.runtime.matmul_linear(mlp_hidden, block.mlp_proj, prefer_tensor_cores=True)
         self.runtime.defer_free(mlp_hidden)
-        mlp_proj = self.runtime.matmul_linear(mlp_act, block.mlp_proj, prefer_tensor_cores=True)
-        self.runtime.defer_free(mlp_act)
 
         if block_index + 1 < len(self.blocks):
           next_block = self.blocks[block_index + 1]
@@ -329,10 +335,10 @@ class TBGPUGPT:
       x = self.runtime.layernorm(x, self.ln_f_weight, self.ln_f_bias)
       last = self.runtime.take_last_token(x, batch_size=batch_size, seq_len=seq_len)
       self.runtime.defer_free(x)
-      logits_dev = self.runtime.matmul_fp32(last, self.lm_head.weight_fp32_t, self.lm_head.bias)
+      logits_dev = self.runtime.matmul_linear(last, self.lm_head, prefer_tensor_cores=True)
       self.runtime.defer_free(last)
       self.runtime.synchronize()
-      logits = self.runtime.download(logits_dev).view(batch_size, 1, self.config.vocab_size)
+      logits = self.runtime.download(logits_dev).view(batch_size, 1, self.lm_head_padded_vocab_size)[..., : self.lm_head_vocab_size]
       self.runtime.free(logits_dev)
       logits_dev = None
       return logits, None

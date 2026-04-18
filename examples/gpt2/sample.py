@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import os
 import sys
 
 import torch
@@ -25,6 +26,7 @@ def _load_tiktoken():
     import tiktoken
   except ImportError:
     return None
+  os.environ.setdefault("TIKTOKEN_CACHE_DIR", "debug_agent/data-gym-cache")
   return tiktoken.get_encoding("gpt2")
 
 

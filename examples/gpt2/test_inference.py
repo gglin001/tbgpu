@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import os
 import sys
 import time
 
@@ -57,6 +58,7 @@ def _load_tiktoken():
     import tiktoken
   except ImportError as exc:
     raise RuntimeError("tiktoken is required for the pretrained GPT-2 test") from exc
+  os.environ.setdefault("TIKTOKEN_CACHE_DIR", "debug_agent/data-gym-cache")
   return tiktoken.get_encoding("gpt2")
 
 
