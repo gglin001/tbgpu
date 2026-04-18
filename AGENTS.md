@@ -2,11 +2,9 @@
 
 ## Project Structure & Module Organization
 
-- `tbgpu/` is the main package.
-- `tbgpu/runtime/` contains device bring-up, memory management, ELF and program loading, and transport code.
-- `tbgpu/support/` holds low-level C helpers.
-- `tbgpu/autogen/` contains generated bindings and constants, so avoid routine manual edits there.
-- `tests/` stores executable validation scripts, and `tests/kernels/` holds the CUDA and PTX sources they compile or load.
+- `tbgpu/` is the main Python package. Core runtime code lives in `tbgpu/runtime/`, NVIDIA-specific pieces in `tbgpu/runtime/nv/`, low-level helpers in `tbgpu/support/`, and generated bindings in `tbgpu/autogen/`.
+- `tbgpu/tinygpu/` is a separate macOS/Xcode app and driver tree. Keep edits there intentional, and avoid unrelated project-file churn.
+- `tests/` contains script-style integration checks, with kernels in `tests/kernels/`.
 - `scripts/`: scripts for develop.
 - `third_party/` is vendored upstream code that should only change during deliberate snapshot updates.
 - `debug_agent/`: untracked scratch workspace for temp files and local experiments (use this instead of `/tmp`).
@@ -17,16 +15,13 @@
 - `python tests/vector_add.py --kernel-input ptx` runs the basic smoke test.
 - `python tests/matmul.py --verify-suite` and `python tests/flash_attn_v2.py --verify-suite` exercise larger kernels and numeric checks.
 - `CUDA_PTI=1 python tests/kernel_profile.py --kernel-input ptx --iters 100` captures event and PTI-like timing data.
-
-Most runtime checks expect `TinyGPU.app` to be available under `/Applications/TinyGPU.app/Contents/MacOS/TinyGPU`. Any `cuda`/`ptx` path also requires `nvcc` in `PATH`.
+- Most runtime checks expect `/Applications/TinyGPU.app/Contents/MacOS/TinyGPU`. CUDA and PTX flows also need `nvcc` in `PATH`.
 
 ## Coding Style & Naming Conventions
 
-Use Python with `from __future__ import annotations` and add type hints where they improve clarity. Match the existing 2-space indentation, keep lines within the Ruff limit of 150 characters, and prefer `snake_case` for functions, variables, and modules. Use `UPPER_CASE` for constants such as `KERNEL_NAME` and `MAX_HEAD_DIM`. Run `ruff check .` and `ruff format .` before sending a patch.
-
-## Testing Guidelines
-
-This repository currently relies on script-style integration checks instead of a real `pytest` suite. Add new coverage as a runnable file under `tests/` and place companion kernels in `tests/kernels/`, keeping names aligned, for example `tests/reduce_max.py` with `tests/kernels/reduce_max.cu`. Successful checks should validate numerical results and print the launch shape, timing, or max error.
+- Use Python with `from __future__ import annotations` in new modules, 2-space indentation, type hints where they help, `snake_case` names, and `UPPER_CASE` constants.
+- Run `ruff check .` and `ruff format .`. For larger changes, also run `pre-commit run --all-files`.
+- Do not hand-edit `tbgpu/autogen/` unless you are intentionally regenerating bindings.
 
 ## Workspace Hygiene and `.gitignore` Policy
 
