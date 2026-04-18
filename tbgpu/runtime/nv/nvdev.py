@@ -1,14 +1,16 @@
 from __future__ import annotations
 import ctypes, time, functools, re, gzip, struct
+import pathlib
 
 from tbgpu.autogen import pci
-from tbgpu.helpers import DEBUG, fetch, getenv, getbits
+from tbgpu.helpers import DEBUG, getenv, getbits
 from tbgpu.runtime.common import MMIOInterface
 from tbgpu.runtime.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tbgpu.runtime.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP
 from tbgpu.runtime.transport import APLRemotePCIDevice
 
 NV_DEBUG = getenv("NV_DEBUG", 0)
+OPEN_GPU_KERNEL_MODULES_ROOT = pathlib.Path(__file__).resolve().parents[3] / "third_party" / "open-gpu-kernel-modules"
 
 
 class NVReg:
@@ -214,14 +216,16 @@ class NVDev:
     view[:sz] = bytes(struct)
     return view, paddrs[0]
 
-  def _download(self, file: str) -> str:
-    url = f"https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/{file}"
-    return fetch(url, subdir="defines").read_text()
+  def _read_ogkm_text(self, file: str) -> str:
+    path = OPEN_GPU_KERNEL_MODULES_ROOT / file
+    if not path.is_file():
+      raise FileNotFoundError(f"Missing {path}. Initialize third_party/open-gpu-kernel-modules first.")
+    return path.read_text()
 
   def extract_fw(self, file: str, dname: str) -> bytes:
     # Extracts the firmware binary from the given header
     tname = file.replace("kgsp", "kgspGet")
-    text = self._download(f"src/nvidia/generated/g_bindata_{tname}_{self.fw_name}.c")
+    text = self._read_ogkm_text(f"src/nvidia/generated/g_bindata_{tname}_{self.fw_name}.c")
     info, sl = text[text[: text.index(dnm := f"{file}_{self.fw_name}_{dname}")].rindex("COMPRESSION:") :][:16], text[text.index(dnm) + len(dnm) + 7 :]
     image = bytes.fromhex(sl[: sl.find("};")].strip().replace("0x", "").replace(",", "").replace(" ", "").replace("\n", ""))
     return gzip.decompress(struct.pack("<4BL2B", 0x1F, 0x8B, 8, 0, 0, 0, 3) + image) if "COMPRESSION: YES" in info else image
@@ -248,7 +252,7 @@ class NVDev:
       "NV_THERM": 0x0,
     }
 
-    for raw in self._download(file).splitlines():
+    for raw in self._read_ogkm_text(file).splitlines():
       if not raw.startswith("#define "):
         continue
 

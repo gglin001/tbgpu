@@ -1,12 +1,15 @@
 from __future__ import annotations
 import ctypes, time, array, struct, itertools, dataclasses
+import pathlib
 from typing import cast, Any
 
 from tbgpu.autogen import nv, nv_570 as nv_gpu, pci
-from tbgpu.helpers import DEBUG, ceildiv, fetch, hi32, lo32, round_down, round_up, wait_cond
+from tbgpu.helpers import DEBUG, ceildiv, hi32, lo32, round_down, round_up, wait_cond
 from tbgpu.runtime.common import MMIOInterface
 from tbgpu.runtime.elf import elf_loader
 from tbgpu.runtime.transport import System
+
+GSP_FW_PATH = pathlib.Path(__file__).resolve().parents[3] / "third_party" / "linux-firmware" / "nvidia" / "ga102" / "gsp" / "gsp-570.144.bin"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,8 +125,10 @@ class NVRpcQueue:
 class NV_FLCN(NV_IP):
   def wait_for_reset(self):
     wait_cond(
-      lambda _: self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK.read_bitfields()["read_protection_level0"] == 1
-      and self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05[0].read() & 0xFF == 0xFF,
+      lambda _: (
+        self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK.read_bitfields()["read_protection_level0"] == 1
+        and self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05[0].read() & 0xFF == 0xFF
+      ),
       "waiting for reset",
     )
 
@@ -511,7 +516,9 @@ class NV_GSP(NV_IP):
     libos_args_view[: sum(ctypes.sizeof(s) for s in libos_structs)] = b"".join(bytes(s) for s in libos_structs)
 
   def init_gsp_image(self):
-    fw = fetch("https://github.com/NVIDIA/linux-firmware/raw/refs/heads/nvidia-staging/nvidia/ga102/gsp/gsp-570.144.bin", subdir="fw").read_bytes()
+    if not GSP_FW_PATH.is_file():
+      raise FileNotFoundError(f"Missing {GSP_FW_PATH}. Initialize third_party/linux-firmware first.")
+    fw = GSP_FW_PATH.read_bytes()
 
     _, sections, _ = elf_loader(fw)
     self.gsp_image = next((sh.content for sh in sections if sh.name == ".fwimage"))
@@ -846,7 +853,7 @@ class NV_GSP(NV_IP):
         self.nvdev.wreg(addr, (self.nvdev.rreg(addr) & ~mask) | (val & mask))
       elif op == 0x2:  # reg poll
         addr, mask, val, _, _ = next(cmd_iter), next(cmd_iter), next(cmd_iter), next(cmd_iter), next(cmd_iter)
-        wait_cond(lambda a, m: (self.nvdev.rreg(a) & m), addr, mask, value=val, msg=f"Register {addr:#x} not equal to {val:#x} after polling")
+        wait_cond(lambda a, m: self.nvdev.rreg(a) & m, addr, mask, value=val, msg=f"Register {addr:#x} not equal to {val:#x} after polling")
       elif op == 0x3:
         time.sleep(next(cmd_iter) / 1e6)  # delay us
       elif op == 0x4:  # save reg

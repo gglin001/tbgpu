@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import contextlib
 import ctypes
-import hashlib
 import math
 import os
 import pathlib
 import tempfile
 import time
-import urllib.parse
-import urllib.request
 from typing import Any, TypeVar
 
 T = TypeVar("T")
@@ -99,23 +95,3 @@ def from_mv(mv: memoryview, to_type: type[ctypes._SimpleCData] = ctypes.c_char):
 
 def temp(name: str) -> str:
   return str(pathlib.Path(tempfile.gettempdir()) / name)
-
-
-def _downloads_dir() -> pathlib.Path:
-  path = pathlib.Path(os.getenv("TBGPU_CACHE_DIR", pathlib.Path.home() / ".cache" / "tbgpu"))
-  path.mkdir(parents=True, exist_ok=True)
-  return path
-
-
-def fetch(url: str, *, name: str | None = None, subdir: str = "downloads") -> pathlib.Path:
-  root = _downloads_dir() / subdir
-  root.mkdir(parents=True, exist_ok=True)
-  if name is None:
-    digest = hashlib.sha256(url.encode()).hexdigest()[:16]
-    name = f"{digest}-{pathlib.Path(urllib.parse.urlparse(url).path).name or 'download'}"
-  path = root / name
-  if path.exists():
-    return path
-  with contextlib.closing(urllib.request.urlopen(url)) as resp:
-    path.write_bytes(resp.read())
-  return path
