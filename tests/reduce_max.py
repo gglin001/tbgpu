@@ -36,7 +36,7 @@ def _kernel_source() -> str:
   return kernel_path.read_text()
 
 
-def _launch_reduce_max(func, inp, out, size: int, blocks: int, block_size: int, shared_nbytes: int):
+def _launch_reduce_max(func, inp, out, size: int, blocks: int, block_size: int, shared_nbytes: int, stream):
   arg_blob = struct.pack("<QQI", inp.value, out.value, size)
   arg_buf = ctypes.create_string_buffer(arg_blob)
   arg_size = ctypes.c_size_t(len(arg_blob))
@@ -47,7 +47,7 @@ def _launch_reduce_max(func, inp, out, size: int, blocks: int, block_size: int, 
     ctypes.cast(ctypes.pointer(arg_size), ctypes.c_void_p),
     ctypes.c_void_p(0),
   )
-  _check(cuda.cuLaunchKernel(func, blocks, 1, 1, block_size, 1, 1, shared_nbytes, None, None, extra))
+  _check(cuda.cuLaunchKernel(func, blocks, 1, 1, block_size, 1, 1, shared_nbytes, stream, None, extra))
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -89,6 +89,7 @@ def run_reduce_max(
   dev = init_c_var(cuda.CUdevice, lambda x: _check(cuda.cuDeviceGet(ctypes.byref(x), 0)))
   ctx = init_c_var(cuda.CUcontext, lambda x: _check(cuda.cuCtxCreate_v2(ctypes.byref(x), 0, dev.value)))
   _check(cuda.cuCtxSetCurrent(ctx))
+  stream = init_c_var(cuda.CUstream, lambda x: _check(cuda.cuStreamCreate(ctypes.byref(x), 0)))
 
   module = None
   d_in, d_tmp0, d_tmp1 = cuda.CUdeviceptr(), cuda.CUdeviceptr(), cuda.CUdeviceptr()
@@ -108,7 +109,7 @@ def run_reduce_max(
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_in), nbytes))
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_tmp0), temp_nbytes))
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_tmp1), temp_nbytes))
-    _check(cuda.cuMemcpyHtoDAsync_v2(d_in, _buffer_ptr(host_in), nbytes, None))
+    _check(cuda.cuMemcpyHtoDAsync_v2(d_in, _buffer_ptr(host_in), nbytes, stream))
 
     current_ptr = d_in
     current_size = size
@@ -118,18 +119,20 @@ def run_reduce_max(
     while current_size > 1:
       out_ptr = temp_ptrs[stages & 1]
       blocks = _grid_blocks(current_size, block_size, max_blocks)
-      _launch_reduce_max(func, current_ptr, out_ptr, current_size, blocks, block_size, shared_nbytes)
+      _launch_reduce_max(func, current_ptr, out_ptr, current_size, blocks, block_size, shared_nbytes, stream)
       current_ptr = out_ptr
       current_size = blocks
       stages += 1
 
-    _check(cuda.cuCtxSynchronize())
+    _check(cuda.cuStreamSynchronize(stream))
     host_out = array.array("f", [0.0])
     _check(cuda.cuMemcpyDtoH_v2(_buffer_ptr(host_out), current_ptr, ctypes.sizeof(ctypes.c_float)))
   finally:
     for ptr in [d_tmp1, d_tmp0, d_in]:
       if ptr.value not in (None, 0):
         cuda.cuMemFree_v2(ptr)
+    if stream.value not in (None, 0):
+      cuda.cuStreamDestroy_v2(stream)
     if module is not None:
       cuda.cuModuleUnload(module)
     cuda.cuCtxDestroy_v2(ctx)

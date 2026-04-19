@@ -119,6 +119,7 @@ def run_vector_add(
   kernel_image = load_kernel_image(arch, kernel_input, emit_ptx=emit_ptx, emit_cubin=emit_cubin)
   module = init_c_var(cuda.CUmodule, lambda x: _check(cuda.cuModuleLoadData(ctypes.byref(x), kernel_image)))
   func = init_c_var(cuda.CUfunction, lambda x: _check(cuda.cuModuleGetFunction(ctypes.byref(x), module, KERNEL_NAME.encode())))
+  stream = init_c_var(cuda.CUstream, lambda x: _check(cuda.cuStreamCreate(ctypes.byref(x), 0)))
   a = array.array("f", (float(i) for i in range(size)))
   b = array.array("f", (float(2 * i + 1) for i in range(size)))
   out = array.array("f", [0.0] * size)
@@ -128,24 +129,26 @@ def run_vector_add(
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_a), nbytes))
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_b), nbytes))
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_out), nbytes))
-    _check(cuda.cuMemcpyHtoDAsync_v2(d_a, _buffer_ptr(a), nbytes, None))
-    _check(cuda.cuMemcpyHtoDAsync_v2(d_b, _buffer_ptr(b), nbytes, None))
+    _check(cuda.cuMemcpyHtoDAsync_v2(d_a, _buffer_ptr(a), nbytes, stream))
+    _check(cuda.cuMemcpyHtoDAsync_v2(d_b, _buffer_ptr(b), nbytes, stream))
     if size > 0:
       grid = ((size + block_size - 1) // block_size, 1, 1)
       block = (block_size, 1, 1)
       args = VecAddArgs(d_a.value, d_b.value, d_out.value, size)
       if launch_mode == "kernel_params":
         params, _ = _make_kernel_params(args)
-        _check(cuda.cuLaunchKernel(func, *grid, *block, 0, None, params, None))
+        _check(cuda.cuLaunchKernel(func, *grid, *block, 0, stream, params, None))
       else:
         extra, _ = _make_extra(args)
-        _check(cuda.cuLaunchKernel(func, *grid, *block, 0, None, None, extra))
-    _check(cuda.cuCtxSynchronize())
+        _check(cuda.cuLaunchKernel(func, *grid, *block, 0, stream, None, extra))
+    _check(cuda.cuStreamSynchronize(stream))
     _check(cuda.cuMemcpyDtoH_v2(_buffer_ptr(out), d_out, nbytes))
   finally:
     for ptr in [d_out, d_b, d_a]:
       if ptr.value not in (None, 0):
         cuda.cuMemFree_v2(ptr)
+    if stream.value not in (None, 0):
+      cuda.cuStreamDestroy_v2(stream)
     cuda.cuModuleUnload(module)
     cuda.cuCtxDestroy_v2(ctx)
   expected = array.array("f", (x + y for x, y in zip(a, b)))

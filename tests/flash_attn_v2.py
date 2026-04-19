@@ -166,6 +166,7 @@ def run_flash_attn_v2(
   dev = init_c_var(cuda.CUdevice, lambda x: _check(cuda.cuDeviceGet(ctypes.byref(x), 0)))
   ctx = init_c_var(cuda.CUcontext, lambda x: _check(cuda.cuCtxCreate_v2(ctypes.byref(x), 0, dev.value)))
   _check(cuda.cuCtxSetCurrent(ctx))
+  stream = init_c_var(cuda.CUstream, lambda x: _check(cuda.cuStreamCreate(ctypes.byref(x), 0)))
 
   module = None
   q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr = [cuda.CUdeviceptr() for _ in range(5)]
@@ -188,9 +189,9 @@ def run_flash_attn_v2(
     _check(cuda.cuMemAlloc_v2(ctypes.byref(o_ptr), out_nbytes))
     _check(cuda.cuMemAlloc_v2(ctypes.byref(lse_ptr), lse_nbytes))
 
-    _check(cuda.cuMemcpyHtoDAsync_v2(q_ptr, _buffer_ptr(q), q_nbytes, None))
-    _check(cuda.cuMemcpyHtoDAsync_v2(k_ptr, _buffer_ptr(k), k_nbytes, None))
-    _check(cuda.cuMemcpyHtoDAsync_v2(v_ptr, _buffer_ptr(v), v_nbytes, None))
+    _check(cuda.cuMemcpyHtoDAsync_v2(q_ptr, _buffer_ptr(q), q_nbytes, stream))
+    _check(cuda.cuMemcpyHtoDAsync_v2(k_ptr, _buffer_ptr(k), k_nbytes, stream))
+    _check(cuda.cuMemcpyHtoDAsync_v2(v_ptr, _buffer_ptr(v), v_nbytes, stream))
 
     params, _ = _make_kernel_params(
       q_ptr.value,
@@ -208,8 +209,8 @@ def run_flash_attn_v2(
     grid = ((seq_len + BLOCK_M - 1) // BLOCK_M, num_heads, batch_size)
     block = (WARP_SIZE, BLOCK_M, 1)
     shared_nbytes = (2 * BLOCK_N * head_dim + BLOCK_M * BLOCK_N + 3 * BLOCK_M) * ctypes.sizeof(ctypes.c_float)
-    _check(cuda.cuLaunchKernel(func, *grid, *block, shared_nbytes, None, params, None))
-    _check(cuda.cuCtxSynchronize())
+    _check(cuda.cuLaunchKernel(func, *grid, *block, shared_nbytes, stream, params, None))
+    _check(cuda.cuStreamSynchronize(stream))
 
     _check(cuda.cuMemcpyDtoH_v2(_buffer_ptr(host_out), o_ptr, out_nbytes))
     _check(cuda.cuMemcpyDtoH_v2(_buffer_ptr(host_lse), lse_ptr, lse_nbytes))
@@ -217,6 +218,8 @@ def run_flash_attn_v2(
     for ptr in [lse_ptr, o_ptr, v_ptr, k_ptr, q_ptr]:
       if ptr.value not in (None, 0):
         cuda.cuMemFree_v2(ptr)
+    if stream.value not in (None, 0):
+      cuda.cuStreamDestroy_v2(stream)
     if module is not None:
       cuda.cuModuleUnload(module)
     cuda.cuCtxDestroy_v2(ctx)
