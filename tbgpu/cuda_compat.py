@@ -26,6 +26,20 @@ CUevent = ctypes.c_void_p
 CUstream = ctypes.c_void_p
 CUdeviceptr = ctypes.c_uint64
 
+CU_STREAM_DEFAULT = 0x0
+CU_STREAM_NON_BLOCKING = 0x1
+CU_STREAM_LEGACY = 0x1
+CU_STREAM_PER_THREAD = 0x2
+
+CU_EVENT_DEFAULT = 0x0
+CU_EVENT_BLOCKING_SYNC = 0x1
+CU_EVENT_DISABLE_TIMING = 0x2
+CU_EVENT_INTERPROCESS = 0x4
+
+CU_MEMHOSTALLOC_PORTABLE = 0x1
+CU_MEMHOSTALLOC_DEVICEMAP = 0x2
+CU_MEMHOSTALLOC_WRITECOMBINED = 0x4
+
 CUDA_SUCCESS = 0
 CUDA_ERROR_INVALID_VALUE = 1
 CUDA_ERROR_INVALID_DEVICE = 101
@@ -59,6 +73,7 @@ class _ContextState:
   nv_device: Any
   default_stream: _StreamState
   stream_ids: set[int] = field(default_factory=set)
+  per_thread_streams: dict[int, _StreamState] = field(default_factory=dict)
   next_lane: int = 0
 
 
@@ -66,8 +81,11 @@ class _ContextState:
 class _StreamState:
   ctx_id: int
   lane_index: int
+  flags: int = CU_STREAM_DEFAULT
+  default_kind: str | None = None
   tail: Fence | None = None
   pending_waits: list[Fence] = field(default_factory=list)
+  tail_kind: str | None = None
 
 
 @dataclass
@@ -105,12 +123,15 @@ class _HostAllocation:
   base: int
   size: int
   buf: Any
+  owner: Any
+  flags: int = 0
 
 
 @dataclass
 class _EventState:
   ctx_id: int | None = None
   fence: Fence | None = None
+  flags: int = CU_EVENT_DEFAULT
   timestamp_ns: int = 0
 
 
@@ -134,7 +155,7 @@ class _RawArgsState:
     self.buf = buf
 
 
-_HANDLE_COUNTER = itertools.count(1)
+_HANDLE_COUNTER = itertools.count(3)
 _TLS = threading.local()
 _NV_DEVICE_CACHE: dict[int, Any] = {}
 _CONTEXTS: dict[int, _ContextState] = {}
@@ -261,15 +282,46 @@ def _get_nv_device(ordinal: int):
 
 
 def _create_default_stream(ctx_id: int, nv_device: TBGPUDevice) -> _StreamState:
-  return _StreamState(ctx_id=ctx_id, lane_index=0 if nv_device.compute_lane_count > 0 else -1)
+  return _StreamState(
+    ctx_id=ctx_id,
+    lane_index=0 if nv_device.compute_lane_count > 0 else -1,
+    flags=CU_STREAM_DEFAULT,
+    default_kind="legacy",
+  )
+
+
+def _get_per_thread_stream(ctx_id: int, ctx: _ContextState) -> _StreamState:
+  thread_id = threading.get_ident()
+  if thread_id not in ctx.per_thread_streams:
+    ctx.nv_device.ensure_compute_lanes(len(ctx.stream_ids) + len(ctx.per_thread_streams) + 1)
+    ctx.per_thread_streams[thread_id] = _StreamState(
+      ctx_id=ctx_id,
+      lane_index=_next_stream_lane(ctx),
+      flags=CU_STREAM_DEFAULT,
+      default_kind="per_thread",
+    )
+  return ctx.per_thread_streams[thread_id]
+
+
+def _stream_is_non_blocking(stream: _StreamState) -> bool:
+  return stream.default_kind is None and bool(stream.flags & CU_STREAM_NON_BLOCKING)
+
+
+def _stream_syncs_with_legacy(stream: _StreamState) -> bool:
+  if stream.default_kind == "legacy":
+    return False
+  return not _stream_is_non_blocking(stream)
 
 
 def _get_stream(ctx_id: int, stream) -> _StreamState:
   handle = _as_int(stream)
   if ctx_id not in _CONTEXTS:
     raise RuntimeError("invalid context")
-  if handle == 0:
-    return _CONTEXTS[ctx_id].default_stream
+  ctx = _CONTEXTS[ctx_id]
+  if handle in (0, CU_STREAM_LEGACY):
+    return ctx.default_stream
+  if handle == CU_STREAM_PER_THREAD:
+    return _get_per_thread_stream(ctx_id, ctx)
   if handle not in _STREAMS or _STREAMS[handle].ctx_id != ctx_id:
     raise RuntimeError("invalid stream")
   return _STREAMS[handle]
@@ -277,6 +329,8 @@ def _get_stream(ctx_id: int, stream) -> _StreamState:
 
 def _iter_ctx_streams(ctx: _ContextState):
   yield ctx.default_stream
+  for stream in list(ctx.per_thread_streams.values()):
+    yield stream
   for stream_id in list(ctx.stream_ids):
     if stream_id in _STREAMS:
       yield _STREAMS[stream_id]
@@ -290,9 +344,7 @@ def _next_stream_lane(ctx: _ContextState) -> int:
 
 
 def _synchronize_stream(stream: _StreamState, timeout: int | None = None):
-  if stream.tail is not None:
-    stream.tail.wait(timeout=timeout)
-  for fence in _dedupe_fences(*stream.pending_waits):
+  for fence in _stream_submission_waits(stream):
     fence.wait(timeout=timeout)
   stream.pending_waits.clear()
 
@@ -378,6 +430,13 @@ def _find_device_alloc(ptr: int):
   return None
 
 
+def _find_host_alloc(ptr: int):
+  for alloc in _HOST_ALLOCS.values():
+    if alloc.base <= ptr < alloc.base + alloc.size:
+      return alloc, ptr - alloc.base
+  return None
+
+
 def _dedupe_fences(*fences: Fence | None) -> list[Fence]:
   unique: list[Fence] = []
   seen: set[tuple[int, int]] = set()
@@ -392,14 +451,31 @@ def _dedupe_fences(*fences: Fence | None) -> list[Fence]:
   return unique
 
 
+def _legacy_stream_waits(stream: _StreamState) -> list[Fence]:
+  ctx = _CONTEXTS[stream.ctx_id]
+  waits: list[Fence | None] = [stream.tail, *stream.pending_waits]
+  for other in _iter_ctx_streams(ctx):
+    if other is stream or not _stream_syncs_with_legacy(other):
+      continue
+    waits.extend([other.tail, *other.pending_waits])
+  return _dedupe_fences(*waits)
+
+
 def _stream_submission_waits(stream: _StreamState, *extra_waits: Fence | None) -> list[Fence]:
-  return _dedupe_fences(stream.tail, *stream.pending_waits, *extra_waits)
+  waits: list[Fence | None] = [stream.tail, *stream.pending_waits, *extra_waits]
+  if stream.default_kind == "legacy":
+    waits.extend(_legacy_stream_waits(stream))
+  elif _stream_syncs_with_legacy(stream):
+    legacy = _CONTEXTS[stream.ctx_id].default_stream
+    waits.extend([legacy.tail, *legacy.pending_waits])
+  return _dedupe_fences(*waits)
 
 
-def _advance_stream(stream: _StreamState, completion: Fence | None):
+def _advance_stream(stream: _StreamState, completion: Fence | None, kind: str | None = None):
   stream.pending_waits.clear()
   if completion is not None:
     stream.tail = completion
+    stream.tail_kind = kind
 
 
 def _submit_stream_marker(stream: _StreamState, wait_fences: list[Fence] | None = None, *, timestamp: bool = False) -> Fence:
@@ -417,13 +493,24 @@ def _submit_stream_marker(stream: _StreamState, wait_fences: list[Fence] | None 
     q.signal(completion.signal, completion.value)
   q.submit(lane)
   lane.record_submission(completion)
-  _advance_stream(stream, completion)
+  _advance_stream(stream, completion, kind="marker")
   return completion
+
+
+def _submit_buffer_copy(dst, src, size: int, stream: _StreamState):
+  waits = _stream_submission_waits(stream)
+  completion = src.owner.allocator._transfer(dst, src, size, src.owner, dst.owner, waits=waits)
+  _advance_stream(stream, completion, kind="copy")
 
 
 def _copy_to_device(dst_ptr: int, src_ptr: int, size: int, stream: _StreamState):
   if (dst_info := _find_device_alloc(dst_ptr)) is None:
     raise RuntimeError(f"unknown device pointer 0x{dst_ptr:x}")
+  dst_alloc, dst_off = dst_info
+  if (src_info := _find_host_alloc(src_ptr)) is not None:
+    src_alloc, src_off = src_info
+    _submit_buffer_copy(dst_alloc.buf.offset(offset=dst_off, size=size), src_alloc.buf.offset(offset=src_off, size=size), size, stream)
+    return
   alloc, offset = dst_info
   waits = _stream_submission_waits(stream)
   completion = alloc.owner.allocator._copyin(
@@ -432,16 +519,34 @@ def _copy_to_device(dst_ptr: int, src_ptr: int, size: int, stream: _StreamState)
   if completion is None:
     for fence in waits:
       fence.wait()
-  _advance_stream(stream, completion)
+  _advance_stream(stream, completion, kind="copy")
 
 
 def _copy_from_device(dst_ptr: int, src_ptr: int, size: int):
   if (src_info := _find_device_alloc(src_ptr)) is None:
     raise RuntimeError(f"unknown device pointer 0x{src_ptr:x}")
+  if (dst_info := _find_host_alloc(dst_ptr)) is not None:
+    dst_alloc, dst_off = dst_info
+    src_alloc, src_off = src_info
+    stream = _get_stream(_as_int(_get_current_context_id()), CU_STREAM_LEGACY)
+    _submit_buffer_copy(dst_alloc.buf.offset(offset=dst_off, size=size), src_alloc.buf.offset(offset=src_off, size=size), size, stream)
+    _synchronize_stream(stream)
+    return
   alloc, offset = src_info
   tmp = bytearray(size)
   alloc.owner.allocator._copyout(memoryview(tmp), alloc.buf.offset(offset=offset, size=size))
   ctypes.memmove(dst_ptr, bytes(tmp), size)
+
+
+def _copy_from_device_async(dst_ptr: int, src_ptr: int, size: int, stream: _StreamState):
+  if (src_info := _find_device_alloc(src_ptr)) is None:
+    raise RuntimeError(f"unknown device pointer 0x{src_ptr:x}")
+  if (dst_info := _find_host_alloc(dst_ptr)) is not None:
+    dst_alloc, dst_off = dst_info
+    src_alloc, src_off = src_info
+    _submit_buffer_copy(dst_alloc.buf.offset(offset=dst_off, size=size), src_alloc.buf.offset(offset=src_off, size=size), size, stream)
+    return
+  _copy_from_device(dst_ptr, src_ptr, size)
 
 
 def _copy_device_to_device(dst_ptr: int, src_ptr: int, size: int, stream: _StreamState):
@@ -449,16 +554,7 @@ def _copy_device_to_device(dst_ptr: int, src_ptr: int, size: int, stream: _Strea
     raise RuntimeError("unknown device pointer")
   dst_alloc, dst_off = dst_info
   src_alloc, src_off = src_info
-  waits = _stream_submission_waits(stream)
-  completion = src_alloc.owner.allocator._transfer(
-    dst_alloc.buf.offset(offset=dst_off, size=size),
-    src_alloc.buf.offset(offset=src_off, size=size),
-    size,
-    src_alloc.owner,
-    dst_alloc.owner,
-    waits=waits,
-  )
-  _advance_stream(stream, completion)
+  _submit_buffer_copy(dst_alloc.buf.offset(offset=dst_off, size=size), src_alloc.buf.offset(offset=src_off, size=size), size, stream)
 
 
 def _build_launch_cbuf0(prg, grid: tuple[int, int, int], block: tuple[int, int, int]) -> bytes:
@@ -497,9 +593,11 @@ def _launch(
   view[: len(prefix)] = prefix
   view[len(prefix) : len(prefix) + len(arg_blob)] = arg_blob
   q = NVComputeQueue()
-  for fence in _stream_submission_waits(stream):
+  waits = _stream_submission_waits(stream)
+  for fence in waits:
     q.wait(fence.signal, fence.value)
-  q.memory_barrier()
+  if stream.tail_kind != "launch" or any(fence is not stream.tail for fence in waits):
+    q.memory_barrier()
   prof_st = dev.new_signal() if CUDA_PTI else None
   prof_en = dev.new_signal() if CUDA_PTI else None
   if prof_st is not None:
@@ -510,7 +608,7 @@ def _launch(
   completion = dev.new_fence()
   q.signal(completion.signal, completion.value).submit(lane)
   lane.record_submission(completion)
-  _advance_stream(stream, completion)
+  _advance_stream(stream, completion, kind="launch")
   if prof_st is not None and prof_en is not None:
     with _PTI_LOCK:
       _PTI_PENDING.append(
@@ -568,6 +666,7 @@ def cuCtxDestroy_v2(ctx) -> int:
   for event in _EVENTS.values():
     if event.ctx_id == ctx_id:
       event.ctx_id, event.fence = None, None
+  ctx.per_thread_streams.clear()
   for stream_id in list(ctx.stream_ids):
     _STREAMS.pop(stream_id, None)
   if _get_current_context_id() == ctx_id:
@@ -651,10 +750,34 @@ def cuMemFree_v2(dptr) -> int:
 
 
 def cuMemHostAlloc(pp, bytesize: int, flags: int) -> int:
-  host_buf = ctypes.create_string_buffer(bytesize)
-  ptr = ctypes.addressof(host_buf)
-  _HOST_ALLOCS[ptr] = _HostAllocation(base=ptr, size=bytesize, buf=host_buf)
+  if flags & ~(CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_WRITECOMBINED):
+    return CUDA_ERROR_INVALID_VALUE
+  try:
+    ctx = _get_ctx()
+    host_buf = ctx.nv_device.allocator.alloc(
+      bytesize,
+      host=True,
+      cpu_access=True,
+      contiguous=bool(flags & CU_MEMHOSTALLOC_WRITECOMBINED),
+    )
+  except Exception:
+    return CUDA_ERROR_INVALID_CONTEXT
+  ptr = host_buf.cpu_view().addr
+  _HOST_ALLOCS[ptr] = _HostAllocation(base=ptr, size=bytesize, buf=host_buf, owner=ctx.nv_device, flags=flags)
   pp._obj.value = ptr
+  return CUDA_SUCCESS
+
+
+def cuMemHostGetDevicePointer(pdptr, p, flags: int) -> int:
+  if flags != 0:
+    return CUDA_ERROR_INVALID_VALUE
+  ptr = _as_int(p)
+  if (alloc_info := _find_host_alloc(ptr)) is None:
+    return CUDA_ERROR_INVALID_VALUE
+  alloc, offset = alloc_info
+  if not (alloc.flags & CU_MEMHOSTALLOC_DEVICEMAP):
+    return CUDA_ERROR_INVALID_VALUE
+  pdptr._obj.value = alloc.buf.va_addr + offset
   return CUDA_SUCCESS
 
 
@@ -662,8 +785,18 @@ def cuMemFreeHost(p) -> int:
   ptr = _as_int(p)
   if ptr not in _HOST_ALLOCS:
     return CUDA_ERROR_INVALID_VALUE
-  del _HOST_ALLOCS[ptr]
+  alloc = _HOST_ALLOCS.pop(ptr)
+  try:
+    alloc.owner.synchronize()
+  except RuntimeError:
+    _HOST_ALLOCS[ptr] = alloc
+    return CUDA_ERROR_LAUNCH_FAILED
+  alloc.owner.allocator.free(alloc.buf, alloc.size)
   return CUDA_SUCCESS
+
+
+def _legacy_stream(ctx_id: int) -> _StreamState:
+  return _get_stream(ctx_id, CU_STREAM_LEGACY)
 
 
 def cuMemcpyHtoDAsync_v2(dst, src, bytesize: int, stream) -> int:
@@ -677,9 +810,59 @@ def cuMemcpyHtoDAsync_v2(dst, src, bytesize: int, stream) -> int:
   return CUDA_SUCCESS
 
 
+def cuMemcpyHtoD_v2(dst, src, bytesize: int) -> int:
+  try:
+    ctx_id = _get_current_context_id()
+    if ctx_id not in _CONTEXTS:
+      return CUDA_ERROR_INVALID_CONTEXT
+    stream = _legacy_stream(ctx_id)
+    _copy_to_device(_as_int(dst), _as_int(src), bytesize, stream)
+    _synchronize_stream(stream)
+  except RuntimeError:
+    return CUDA_ERROR_LAUNCH_FAILED
+  except Exception:
+    return CUDA_ERROR_INVALID_VALUE
+  return CUDA_SUCCESS
+
+
 def cuMemcpyDtoH_v2(dst, src, bytesize: int) -> int:
   try:
-    _copy_from_device(_as_int(dst), _as_int(src), bytesize)
+    ctx_id = _get_current_context_id()
+    if ctx_id not in _CONTEXTS:
+      return CUDA_ERROR_INVALID_CONTEXT
+    stream = _legacy_stream(ctx_id)
+    _copy_from_device_async(_as_int(dst), _as_int(src), bytesize, stream)
+    _synchronize_stream(stream)
+  except RuntimeError:
+    return CUDA_ERROR_LAUNCH_FAILED
+  except Exception:
+    return CUDA_ERROR_INVALID_VALUE
+  return CUDA_SUCCESS
+
+
+def cuMemcpyDtoHAsync_v2(dst, src, bytesize: int, stream) -> int:
+  try:
+    ctx_id = _get_current_context_id()
+    if ctx_id not in _CONTEXTS:
+      return CUDA_ERROR_INVALID_CONTEXT
+    _copy_from_device_async(_as_int(dst), _as_int(src), bytesize, _get_stream(ctx_id, stream))
+  except RuntimeError:
+    return CUDA_ERROR_LAUNCH_FAILED
+  except Exception:
+    return CUDA_ERROR_INVALID_VALUE
+  return CUDA_SUCCESS
+
+
+def cuMemcpyDtoD_v2(dst, src, bytesize: int) -> int:
+  try:
+    ctx_id = _get_current_context_id()
+    if ctx_id not in _CONTEXTS:
+      return CUDA_ERROR_INVALID_CONTEXT
+    stream = _legacy_stream(ctx_id)
+    _copy_device_to_device(_as_int(dst), _as_int(src), bytesize, stream)
+    _synchronize_stream(stream)
+  except RuntimeError:
+    return CUDA_ERROR_LAUNCH_FAILED
   except Exception:
     return CUDA_ERROR_INVALID_VALUE
   return CUDA_SUCCESS
@@ -753,8 +936,14 @@ def cuLaunchKernel(f, gx: int, gy: int, gz: int, lx: int, ly: int, lz: int, shar
   fn_id = _as_int(f)
   if fn_id not in _FUNCTIONS:
     return CUDA_ERROR_INVALID_HANDLE
+  if kernelParams and extra:
+    return CUDA_ERROR_INVALID_VALUE
+  if extra and _extract_extra_blob(extra) is None:
+    return CUDA_ERROR_INVALID_VALUE
+  if kernelParams and _MODULES[_FUNCTIONS[fn_id].module_id].signatures.get(_FUNCTIONS[fn_id].name) is None:
+    return CUDA_ERROR_INVALID_IMAGE
   if (arg_blob := _build_arg_blob(_FUNCTIONS[fn_id], kernelParams, extra)) is None:
-    return CUDA_ERROR_NOT_SUPPORTED
+    return CUDA_ERROR_INVALID_VALUE
   try:
     ctx_id = _MODULES[_FUNCTIONS[fn_id].module_id].ctx_id
     _launch(_FUNCTIONS[fn_id], _get_stream(ctx_id, hStream), arg_blob, (gx, gy, gz), (lx, ly, lz), sharedMemBytes)
@@ -766,8 +955,12 @@ def cuLaunchKernel(f, gx: int, gy: int, gz: int, lx: int, ly: int, lz: int, shar
 
 
 def cuEventCreate(phEvent, flags: int) -> int:
+  if flags & ~(CU_EVENT_BLOCKING_SYNC | CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS):
+    return CUDA_ERROR_INVALID_VALUE
+  if flags & CU_EVENT_INTERPROCESS and not flags & CU_EVENT_DISABLE_TIMING:
+    return CUDA_ERROR_INVALID_VALUE
   event_id = _new_handle()
-  _EVENTS[event_id] = _EventState()
+  _EVENTS[event_id] = _EventState(flags=flags)
   phEvent._obj.value = event_id
   return CUDA_SUCCESS
 
@@ -776,16 +969,17 @@ def cuEventRecord(hEvent, hStream) -> int:
   event_id = _as_int(hEvent)
   if event_id not in _EVENTS:
     return CUDA_ERROR_INVALID_HANDLE
+  event = _EVENTS[event_id]
   try:
     ctx_id = _get_current_context_id()
     if ctx_id not in _CONTEXTS:
       return CUDA_ERROR_INVALID_CONTEXT
-    fence = _submit_stream_marker(_get_stream(ctx_id, hStream), timestamp=True)
+    fence = _submit_stream_marker(_get_stream(ctx_id, hStream), timestamp=not (event.flags & CU_EVENT_DISABLE_TIMING))
   except RuntimeError:
     return CUDA_ERROR_LAUNCH_FAILED
   except Exception:
     return CUDA_ERROR_INVALID_CONTEXT
-  _EVENTS[event_id] = _EventState(ctx_id=ctx_id, fence=fence, timestamp_ns=time.perf_counter_ns())
+  _EVENTS[event_id] = _EventState(ctx_id=ctx_id, fence=fence, flags=event.flags, timestamp_ns=time.perf_counter_ns())
   return CUDA_SUCCESS
 
 
@@ -813,6 +1007,8 @@ def cuEventElapsedTime(pMilliseconds, hStart, hEnd) -> int:
   if st_id not in _EVENTS or en_id not in _EVENTS:
     return CUDA_ERROR_INVALID_HANDLE
   st_ev, en_ev = _EVENTS[st_id], _EVENTS[en_id]
+  if st_ev.flags & CU_EVENT_DISABLE_TIMING or en_ev.flags & CU_EVENT_DISABLE_TIMING:
+    return CUDA_ERROR_INVALID_HANDLE
   if st_ev.fence is not None and en_ev.fence is not None:
     try:
       st_ev.fence.wait()
@@ -832,22 +1028,32 @@ def cuEventDestroy_v2(hEvent) -> int:
   return CUDA_SUCCESS
 
 
+def cuEventCreateWithFlags(phEvent, flags: int) -> int:
+  return cuEventCreate(phEvent, flags)
+
+
 def cuStreamCreate(phStream, flags: int = 0) -> int:
   ctx_id = _get_current_context_id()
   if ctx_id not in _CONTEXTS:
     return CUDA_ERROR_INVALID_CONTEXT
+  if flags not in (CU_STREAM_DEFAULT, CU_STREAM_NON_BLOCKING):
+    return CUDA_ERROR_INVALID_VALUE
   ctx = _CONTEXTS[ctx_id]
-  ctx.nv_device.ensure_compute_lanes(len(ctx.stream_ids) + 1)
+  ctx.nv_device.ensure_compute_lanes(len(ctx.stream_ids) + len(ctx.per_thread_streams) + 1)
   stream_id = _new_handle()
-  _STREAMS[stream_id] = _StreamState(ctx_id=ctx_id, lane_index=_next_stream_lane(ctx))
+  _STREAMS[stream_id] = _StreamState(ctx_id=ctx_id, lane_index=_next_stream_lane(ctx), flags=flags)
   ctx.stream_ids.add(stream_id)
   phStream._obj.value = stream_id
   return CUDA_SUCCESS
 
 
+def cuStreamCreateWithFlags(phStream, flags: int) -> int:
+  return cuStreamCreate(phStream, flags)
+
+
 def cuStreamDestroy_v2(hStream) -> int:
   stream_id = _as_int(hStream)
-  if stream_id == 0:
+  if stream_id in (0, CU_STREAM_LEGACY, CU_STREAM_PER_THREAD):
     return CUDA_ERROR_INVALID_HANDLE
   if stream_id not in _STREAMS:
     return CUDA_ERROR_INVALID_HANDLE
@@ -881,21 +1087,39 @@ def cuStreamWaitEvent(stream, event, flags: int) -> int:
   ctx_id = _get_current_context_id()
   if ctx_id not in _CONTEXTS:
     return CUDA_ERROR_INVALID_CONTEXT
+  if flags != 0:
+    return CUDA_ERROR_INVALID_VALUE
   event_id = _as_int(event)
   if event_id not in _EVENTS:
     return CUDA_ERROR_INVALID_HANDLE
-  if _EVENTS[event_id].ctx_id not in (None, ctx_id):
-    return CUDA_ERROR_INVALID_CONTEXT
-  if _EVENTS[event_id].fence is None:
+  event_state = _EVENTS[event_id]
+  if event_state.ctx_id is not None:
+    if event_state.ctx_id not in _CONTEXTS:
+      return CUDA_ERROR_INVALID_CONTEXT
+    if _CONTEXTS[event_state.ctx_id].nv_device is not _CONTEXTS[ctx_id].nv_device:
+      return CUDA_ERROR_INVALID_CONTEXT
+  if event_state.fence is None:
     return CUDA_SUCCESS
   try:
     target_stream = _get_stream(ctx_id, stream)
-    target_stream.pending_waits = _dedupe_fences(*target_stream.pending_waits, _EVENTS[event_id].fence)
+    target_stream.pending_waits = _dedupe_fences(*target_stream.pending_waits, event_state.fence)
   except Exception:
     return CUDA_ERROR_INVALID_CONTEXT
   return CUDA_SUCCESS
 
 
+cuCtxCreate = cuCtxCreate_v2
+cuCtxDestroy = cuCtxDestroy_v2
+cuEventDestroy = cuEventDestroy_v2
+cuMemAlloc = cuMemAlloc_v2
+cuMemAllocHost = cuMemHostAlloc
+cuMemFree = cuMemFree_v2
+cuMemcpyDtoD = cuMemcpyDtoD_v2
+cuMemcpyDtoDAsync = cuMemcpyDtoDAsync_v2
+cuMemcpyDtoH = cuMemcpyDtoH_v2
+cuMemcpyDtoHAsync = cuMemcpyDtoHAsync_v2
+cuMemcpyHtoD = cuMemcpyHtoD_v2
+cuMemcpyHtoDAsync = cuMemcpyHtoDAsync_v2
 cuStreamDestroy = cuStreamDestroy_v2
 
 
