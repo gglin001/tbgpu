@@ -282,9 +282,16 @@ def _iter_ctx_streams(ctx: _ContextState):
       yield _STREAMS[stream_id]
 
 
+def _cuda_stream_multi_lane_enabled(ctx: _ContextState) -> bool:
+  # TODO: Re-enable CUDA stream multi-lane by default after TinyGPU fixes repeated
+  # compute submissions on additional compute lanes.
+  # TinyGPU's additional compute lanes are not yet stable for repeated CUDA-style submissions.
+  # Keep CUDA streams on lane0 unless the dedicated opt-in is enabled for low-level debugging.
+  return getattr(ctx.nv_device, "multi_lane_enabled", False) and int(os.getenv("TBGPU_ENABLE_CUDA_STREAM_MULTI_LANE", "0")) == 1
+
+
 def _next_stream_lane(ctx: _ContextState) -> int:
-  # TODO: Implement robust multi-lane stream scheduling by default; for now, keep streams on lane0 unless the experimental multi-lane path is enabled.
-  if not getattr(ctx.nv_device, "multi_lane_enabled", False):
+  if not _cuda_stream_multi_lane_enabled(ctx):
     return 0
   lane_count = max(1, ctx.nv_device.compute_lane_count)
   lane = ctx.next_lane % lane_count
@@ -840,7 +847,7 @@ def cuStreamCreate(phStream, flags: int = 0) -> int:
   if ctx_id not in _CONTEXTS:
     return CUDA_ERROR_INVALID_CONTEXT
   ctx = _CONTEXTS[ctx_id]
-  if getattr(ctx.nv_device, "multi_lane_enabled", False):
+  if _cuda_stream_multi_lane_enabled(ctx):
     ctx.nv_device.ensure_compute_lanes(len(ctx.stream_ids) + 1)
   stream_id = _new_handle()
   _STREAMS[stream_id] = _StreamState(ctx_id=ctx_id, lane_index=_next_stream_lane(ctx))
