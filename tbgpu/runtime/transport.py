@@ -26,12 +26,12 @@ class _System:
   def memory_barrier(self):
     self.libsys.atomic_thread_fence(5)
 
-  def flock_acquire(self, name: str) -> int:
+  def flock_acquire(self, name: str, *, wait: bool = False) -> int:
     os.umask(0)
     path = temp(name)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
     try:
-      fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      fcntl.flock(fd, fcntl.LOCK_EX if wait else (fcntl.LOCK_EX | fcntl.LOCK_NB))
     except OSError as exc:
       raise RuntimeError(f"failed to acquire lock {path}") from exc
     return fd
@@ -104,11 +104,11 @@ class RemotePCIDevice:
     RemotePCIDevice._rpc_count += 1
     return (resp[1], resp[2]) + ((RemotePCIDevice._recvall(sock, readout_size) if readout_size else None),) + (fd,)
 
-  def __init__(self, devpref: str, dev_id: int, sock: socket.socket):
+  def __init__(self, devpref: str, dev_id: int, sock: socket.socket, lock_fd: int | None = None):
     self.sock, self.dev_id = sock, dev_id
     self.pcibus = f"remote:{dev_id}"
     self.peer_group = "tinygpu"
-    self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{dev_id}.lock")
+    self.lock_fd = lock_fd if lock_fd is not None else System.flock_acquire(f"{devpref.lower()}_{dev_id}.lock")
     for opt in [socket.SO_SNDBUF, socket.SO_RCVBUF]:
       self.sock.setsockopt(socket.SOL_SOCKET, opt, 64 << 20)
 
@@ -163,4 +163,9 @@ class APLRemotePCIDevice(RemotePCIDevice):
     raise RuntimeError(f"failed to connect to TinyGPU server at {sock_path}")
 
   def __init__(self, devpref: str, dev_id: int):
-    super().__init__(devpref, dev_id, self.connect())
+    lock_fd = System.flock_acquire(f"{devpref.lower()}_{dev_id}.lock", wait=True)
+    try:
+      super().__init__(devpref, dev_id, self.connect(), lock_fd=lock_fd)
+    except Exception:
+      os.close(lock_fd)
+      raise
