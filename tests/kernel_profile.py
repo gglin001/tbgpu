@@ -29,6 +29,7 @@ def run_profile(
   kernel_image = load_kernel_image(arch, kernel_input)
   module = init_c_var(cuda.CUmodule, lambda x: _check(cuda.cuModuleLoadData(ctypes.byref(x), kernel_image)))
   func = init_c_var(cuda.CUfunction, lambda x: _check(cuda.cuModuleGetFunction(ctypes.byref(x), module, KERNEL_NAME.encode())))
+  stream = init_c_var(cuda.CUstream, lambda x: _check(cuda.cuStreamCreate(ctypes.byref(x), 0)))
 
   nbytes = size * ctypes.sizeof(ctypes.c_float)
   a = array.array("f", (float(i) for i in range(size)))
@@ -40,8 +41,8 @@ def run_profile(
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_a), nbytes))
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_b), nbytes))
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_out), nbytes))
-    _check(cuda.cuMemcpyHtoDAsync_v2(d_a, _buffer_ptr(a), nbytes, None))
-    _check(cuda.cuMemcpyHtoDAsync_v2(d_b, _buffer_ptr(b), nbytes, None))
+    _check(cuda.cuMemcpyHtoDAsync_v2(d_a, _buffer_ptr(a), nbytes, stream))
+    _check(cuda.cuMemcpyHtoDAsync_v2(d_b, _buffer_ptr(b), nbytes, stream))
 
     grid = ((size + block_size - 1) // block_size, 1, 1)
     block = (block_size, 1, 1)
@@ -49,16 +50,16 @@ def run_profile(
 
     start = init_c_var(cuda.CUevent, lambda x: _check(cuda.cuEventCreate(ctypes.byref(x), 0)))
     end = init_c_var(cuda.CUevent, lambda x: _check(cuda.cuEventCreate(ctypes.byref(x), 0)))
-    _check(cuda.cuEventRecord(start, None))
+    _check(cuda.cuEventRecord(start, stream))
     for _ in range(iters):
       if launch_mode == "kernel_params":
         scalars = [ctypes.c_uint64(args.a), ctypes.c_uint64(args.b), ctypes.c_uint64(args.c), ctypes.c_uint32(args.n)]
         params = (ctypes.c_void_p * len(scalars))(*[ctypes.addressof(v) for v in scalars])
-        _check(cuda.cuLaunchKernel(func, *grid, *block, 0, None, params, None))
+        _check(cuda.cuLaunchKernel(func, *grid, *block, 0, stream, params, None))
       else:
         extra, _ = _make_extra(args)
-        _check(cuda.cuLaunchKernel(func, *grid, *block, 0, None, None, extra))
-    _check(cuda.cuEventRecord(end, None))
+        _check(cuda.cuLaunchKernel(func, *grid, *block, 0, stream, None, extra))
+    _check(cuda.cuEventRecord(end, stream))
     _check(cuda.cuEventSynchronize(end))
     elapsed_ms = ctypes.c_float(0.0)
     _check(cuda.cuEventElapsedTime(ctypes.byref(elapsed_ms), start, end))
@@ -83,6 +84,8 @@ def run_profile(
     for ptr in [d_out, d_b, d_a]:
       if ptr.value not in (None, 0):
         cuda.cuMemFree_v2(ptr)
+    if stream.value not in (None, 0):
+      cuda.cuStreamDestroy_v2(stream)
     cuda.cuModuleUnload(module)
     cuda.cuCtxDestroy_v2(ctx)
 

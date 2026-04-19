@@ -4,6 +4,7 @@ import array
 import contextlib
 import ctypes
 import mmap
+import os
 from dataclasses import dataclass
 
 from tbgpu.autogen import nv_570 as nv_gpu
@@ -30,6 +31,15 @@ class PCIAllocationMeta:
   hMemory: int = 0
 
 
+@dataclass(frozen=True)
+class Fence:
+  signal: Signal
+  value: int = 1
+
+  def wait(self, timeout: int | None = None):
+    self.signal.wait(self.value, timeout=timeout)
+
+
 @dataclass
 class GPFifo:
   ring: MMIOInterface
@@ -37,6 +47,54 @@ class GPFifo:
   entries_count: int
   token: int
   put_value: int = 0
+
+
+@dataclass
+class RingAllocator:
+  buf: Buffer
+  allocator: BumpAllocator
+  recycle_fence: Fence | None = None
+
+  def reserve(self, size: int, alignment: int = 1) -> Buffer:
+    if self.allocator.wrap and round_up(self.allocator.ptr, alignment) + size > self.allocator.size and self.recycle_fence is not None:
+      self.recycle_fence.wait()
+    addr = self.allocator.alloc(size, alignment)
+    return self.buf.offset(offset=addr - self.buf.va_addr, size=size)
+
+  def mark(self, fence: Fence | None):
+    if fence is not None:
+      self.recycle_fence = fence
+
+
+@dataclass
+class QueueLane:
+  dev: "TBGPUDevice"
+  gpfifo: GPFifo
+  cmdq: RingAllocator
+  tail_fence: Fence | None = None
+
+  def wait_for_submit_slot(self):
+    if self.gpfifo.put_value != 0 and self.gpfifo.put_value % self.gpfifo.entries_count == 0 and self.tail_fence is not None:
+      self.tail_fence.wait()
+
+  def record_submission(self, fence: Fence | None):
+    self.tail_fence = fence
+    self.cmdq.mark(fence)
+
+
+@dataclass
+class ComputeLane(QueueLane):
+  index: int = 0
+  kernargs: RingAllocator | None = None
+
+  def reserve_kernargs(self, size: int, alignment: int = 1) -> Buffer:
+    assert self.kernargs is not None, "compute lane has no kernargs ring"
+    return self.kernargs.reserve(size, alignment)
+
+  def record_submission(self, fence: Fence | None):
+    super().record_submission(fence)
+    if self.kernargs is not None:
+      self.kernargs.mark(fence)
 
 
 class QMD:
@@ -124,19 +182,20 @@ class NVCommandQueue:
     self.active_qmd = None
     return self
 
-  def _submit_to_gpfifo(self, dev: "TBGPUDevice", gpfifo: GPFifo):
-    cmdq_addr = dev.cmdq_allocator.alloc(len(self._q) * 4, 16)
-    cmdq_wptr = (cmdq_addr - dev.cmdq_page.va_addr) // 4
-    dev.cmdq[cmdq_wptr : cmdq_wptr + len(self._q)] = array.array("I", self._q)
-    gpfifo.ring[gpfifo.put_value % gpfifo.entries_count] = (cmdq_addr // 4 << 2) | (len(self._q) << 42) | (1 << 41)
-    gpfifo.gpput[0] = (gpfifo.put_value + 1) % gpfifo.entries_count
+  def _submit_to_gpfifo(self, lane: QueueLane):
+    lane.wait_for_submit_slot()
+    cmdq_buf = lane.cmdq.reserve(len(self._q) * 4, 16)
+    cmdq_wptr = (cmdq_buf.va_addr - lane.cmdq.buf.va_addr) // 4
+    lane.cmdq.buf.cpu_view().view(fmt="I")[cmdq_wptr : cmdq_wptr + len(self._q)] = array.array("I", self._q)
+    lane.gpfifo.ring[lane.gpfifo.put_value % lane.gpfifo.entries_count] = (cmdq_buf.va_addr // 4 << 2) | (len(self._q) << 42) | (1 << 41)
+    lane.gpfifo.gpput[0] = (lane.gpfifo.put_value + 1) % lane.gpfifo.entries_count
     System.memory_barrier()
-    dev.gpu_mmio[0x90 // 4] = gpfifo.token
-    gpfifo.put_value += 1
+    lane.dev.gpu_mmio[0x90 // 4] = lane.gpfifo.token
+    lane.gpfifo.put_value += 1
     return self
 
-  def submit(self, dev: "TBGPUDevice"):
-    self._submit(dev)
+  def submit(self, lane: QueueLane):
+    self._submit(lane)
     return self
 
 
@@ -168,10 +227,27 @@ class NVComputeQueue(NVCommandQueue):
     self.active_qmd = None
     return self
 
-  def exec(self, prg, args_buf: Buffer, global_size: tuple[int, int, int], local_size: tuple[int, int, int]):
+  def exec(self, prg, args_buf: Buffer, global_size: tuple[int, int, int], local_size: tuple[int, int, int], shared_mem_bytes: int = 0):
     qmd_buf = args_buf.offset(round_up(prg.constbufs[0][1], 1 << 8))
     qmd_buf.cpu_view().view(size=prg.qmd.mv.nbytes, fmt="B")[:] = prg.qmd.mv
     qmd = QMD(dev=prg.dev, view=qmd_buf.cpu_view())
+    if shared_mem_bytes:
+      total = round_up(prg.shmem_usage + shared_mem_bytes, 128)
+      smem_cfg = min(conf * 1024 for conf in [32, 64, 100] if conf * 1024 >= total) // 4096 + 1
+      if qmd.ver >= 5:
+        qmd.write(
+          shared_memory_size_shifted7=total >> 7,
+          min_sm_config_shared_mem_size=smem_cfg,
+          target_sm_config_shared_mem_size=smem_cfg,
+          max_sm_config_shared_mem_size=0x1A,
+        )
+      else:
+        qmd.write(
+          shared_memory_size=total,
+          min_sm_config_shared_mem_size=smem_cfg,
+          target_sm_config_shared_mem_size=smem_cfg,
+          max_sm_config_shared_mem_size=0x1A,
+        )
     _write_values(qmd_buf.cpu_view(), "I", qmd.field_offset("cta_raster_width" if qmd.ver < 4 else "grid_width"), *global_size)
     _write_values(qmd_buf.cpu_view(), "H", qmd.field_offset("cta_thread_dimension0"), *local_size[:2])
     _write_values(qmd_buf.cpu_view(), "B", qmd.field_offset("cta_thread_dimension2"), local_size[2])
@@ -211,8 +287,8 @@ class NVComputeQueue(NVCommandQueue):
     self.active_qmd = None
     return self
 
-  def _submit(self, dev: "TBGPUDevice"):
-    self._submit_to_gpfifo(dev, dev.compute_gpfifo)
+  def _submit(self, lane: ComputeLane):
+    self._submit_to_gpfifo(lane)
 
 
 class NVCopyQueue(NVCommandQueue):
@@ -233,8 +309,8 @@ class NVCopyQueue(NVCommandQueue):
     self.nvm(4, nv_gpu.NVC6B5_LAUNCH_DMA, nv_flags("NVC6B5_LAUNCH_DMA", flush_enable="true", semaphore_type="release_four_word_semaphore"))
     return self
 
-  def _submit(self, dev: "TBGPUDevice"):
-    self._submit_to_gpfifo(dev, dev.dma_gpfifo)
+  def _submit(self, lane: QueueLane):
+    self._submit_to_gpfifo(lane)
 
 
 class PCIIface:
@@ -301,8 +377,8 @@ class TBGPUAllocator:
   def __init__(self, dev: "TBGPUDevice", staging_size=(2 << 20), staging_count=2):
     self.dev = dev
     self.staging = [self.dev.iface.alloc(staging_size, host=True, cpu_access=True) for _ in range(staging_count)]
-    self.staging_idx = 0
-    self.staging_timeline = [0] * staging_count
+    self.staging_idx = -1
+    self.staging_fences: list[Fence | None] = [None] * staging_count
 
   def alloc(self, size: int, *, cpu_access=False, host=False, uncached=False, contiguous=False, force_devmem=False) -> Buffer:
     return self.dev.iface.alloc(size, cpu_access=cpu_access, host=host, uncached=uncached, contiguous=contiguous, force_devmem=force_devmem)
@@ -310,44 +386,64 @@ class TBGPUAllocator:
   def free(self, buf: Buffer, size: int | None = None):
     self.dev.iface.free(buf.base)
 
-  def _next_staging(self) -> Buffer:
+  def _next_staging(self) -> tuple[int, Buffer]:
     self.staging_idx = (self.staging_idx + 1) % len(self.staging)
-    self.dev.timeline_signal.wait(self.staging_timeline[self.staging_idx])
-    return self.staging[self.staging_idx]
+    if (fence := self.staging_fences[self.staging_idx]) is not None:
+      fence.wait()
+    return self.staging_idx, self.staging[self.staging_idx]
 
-  def _copyin(self, dest: Buffer, src: memoryview):
+  def _copyin(self, dest: Buffer, src: memoryview, waits: list[Fence] | None = None) -> Fence | None:
+    waits = [fence for fence in waits or [] if fence is not None]
+    completion: Fence | None = None
     for off in range(0, src.nbytes, self.staging[0].size):
-      stage = self._next_staging()
+      stage_idx, stage = self._next_staging()
       chunk = min(stage.size, src.nbytes - off)
       stage.cpu_view().view(size=chunk, fmt="B")[:] = src.cast("B")[off : off + chunk]
-      NVCopyQueue().wait(self.dev.timeline_signal, self.dev.timeline_value - 1).copy(dest.offset(off, chunk), stage.offset(0, chunk), chunk).signal(
-        self.dev.timeline_signal, self.dev.next_timeline()
-      ).submit(self.dev)
-      self.staging_timeline[self.staging_idx] = self.dev.timeline_value - 1
+      completion = self.dev.new_fence()
+      q = NVCopyQueue()
+      for fence in waits:
+        q.wait(fence.signal, fence.value)
+      q.copy(dest.offset(off, chunk), stage.offset(0, chunk), chunk).signal(completion.signal, completion.value).submit(self.dev.dma_lane)
+      self.dev.dma_lane.record_submission(completion)
+      self.staging_fences[stage_idx] = completion
+      waits = [completion]
+    return completion
 
   def _copyout(self, dest: memoryview, src: Buffer):
+    self.dev.synchronize()
     for off in range(0, dest.nbytes, self.staging[0].size):
-      stage = self._next_staging()
+      stage_idx, stage = self._next_staging()
       chunk = min(stage.size, dest.nbytes - off)
-      NVCopyQueue().wait(self.dev.timeline_signal, self.dev.timeline_value - 1).copy(stage.offset(0, chunk), src.offset(off, chunk), chunk).signal(
-        self.dev.timeline_signal, self.dev.next_timeline()
-      ).submit(self.dev)
-      self.staging_timeline[self.staging_idx] = self.dev.timeline_value - 1
-      self.dev.synchronize()
+      completion = self.dev.new_fence()
+      NVCopyQueue().copy(stage.offset(0, chunk), src.offset(off, chunk), chunk).signal(completion.signal, completion.value).submit(self.dev.dma_lane)
+      self.dev.dma_lane.record_submission(completion)
+      self.staging_fences[stage_idx] = completion
+      completion.wait()
       dest.cast("B")[off : off + chunk] = stage.cpu_view().view(size=chunk, fmt="B")[:]
 
-  def _transfer(self, dest: Buffer, src: Buffer, size: int, src_dev: "TBGPUDevice", dest_dev: "TBGPUDevice"):
+  def _transfer(
+    self, dest: Buffer, src: Buffer, size: int, src_dev: "TBGPUDevice", dest_dev: "TBGPUDevice", waits: list[Fence] | None = None
+  ) -> Fence:
     if src_dev is not dest_dev:
       raise NotImplementedError("cross-device transfers are not supported in this minimal runtime")
-    NVCopyQueue().wait(src_dev.timeline_signal, src_dev.timeline_value - 1).copy(dest, src, size).signal(
-      src_dev.timeline_signal, src_dev.next_timeline()
-    ).submit(src_dev)
+    completion = src_dev.new_fence()
+    q = NVCopyQueue()
+    for fence in waits or []:
+      q.wait(fence.signal, fence.value)
+    q.copy(dest, src, size).signal(completion.signal, completion.value).submit(src_dev.dma_lane)
+    src_dev.dma_lane.record_submission(completion)
+    return completion
 
 
 class TBGPUDevice:
   def __init__(self, ordinal: int = 0):
     self.device_id = ordinal
     self.iface = PCIIface(self, ordinal)
+    enable_multi_lane = int(os.getenv("TBGPU_ENABLE_MULTI_LANE", "0")) == 1
+    configured_lanes = max(1, int(os.getenv("TBGPU_COMPUTE_LANES", "2" if enable_multi_lane else "1")))
+    self.multi_lane_enabled = enable_multi_lane or configured_lanes > 1
+    self.requested_compute_lane_count = configured_lanes if self.multi_lane_enabled else 1
+    self.compute_lane_count = 1
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(
       deviceId=self.iface.gpu_instance, hClientShare=self.iface.root, vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES
     )
@@ -377,18 +473,34 @@ class TBGPUDevice:
     self.channel_group = self.iface.rm_alloc(
       self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
     )
-    self.gpfifo_area = self.iface.alloc(0x300000, contiguous=True, cpu_access=True, force_devmem=True, uncached=False)
+    self.gpfifo_stride = 0x100000
+    self.gpfifo_area = self.iface.alloc(
+      self.gpfifo_stride * (self.requested_compute_lane_count + 1), contiguous=True, cpu_access=True, force_devmem=True, uncached=False
+    )
     ctxshare = self.iface.rm_alloc(
       self.channel_group,
       nv_gpu.FERMI_CONTEXT_SHARE_A,
       nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC),
     )
-    self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
-    self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=0x10000, compute=False)
+    self._ctxshare = ctxshare
+    self.compute_lanes: list[ComputeLane] = [self._create_compute_lane(0)]
+    self.dma_lane = QueueLane(
+      dev=self,
+      gpfifo=self._new_gpu_fifo(
+        self.gpfifo_area,
+        ctxshare,
+        self.channel_group,
+        offset=self.gpfifo_stride,
+        entries=0x10000,
+        compute=False,
+      ),
+      cmdq=RingAllocator(
+        self.iface.alloc(0x200000, cpu_access=True),
+        BumpAllocator(size=0x200000, base=0, wrap=True),
+      ),
+    )
+    self.dma_lane.cmdq.allocator.base = self.dma_lane.cmdq.buf.va_addr
     self.iface.rm_control(self.channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
-    self.cmdq_page = self.iface.alloc(0x200000, cpu_access=True)
-    self.cmdq_allocator = BumpAllocator(size=self.cmdq_page.size, base=int(self.cmdq_page.va_addr), wrap=True)
-    self.cmdq = self.cmdq_page.cpu_view().view(fmt="I")
     self.num_gpcs, self.num_tpc_per_gpc, self.num_sm_per_tpc, self.max_warps_per_sm, self.sm_version = self._query_gpu_info(
       "num_gpcs", "num_tpc_per_gpc", "num_sm_per_tpc", "max_warps_per_sm", "sm_version"
     )
@@ -396,14 +508,20 @@ class TBGPUDevice:
       "sm_120" if self.sm_version == 0xA04 else f"sm_{(self.sm_version >> 8) & 0xFF}{(val >> 4) if (val := self.sm_version & 0xFF) > 0xF else val}"
     )
     self.sass_version = ((self.sm_version & 0xF00) >> 4) | (self.sm_version & 0xF)
-    self.allocator = TBGPUAllocator(self)
     self._signal_pages: list[Buffer] = []
     self._signal_alloc: BumpAllocator | None = None
-    self.timeline_signal = self.new_signal()
-    self.timeline_value = 1
-    self.kernargs_buf = self.iface.alloc(16 << 20, cpu_access=True)
-    self.kernargs_offset_allocator = BumpAllocator(self.kernargs_buf.size, wrap=True)
+    self.local_mem_tpc_bytes = 0
+    self.allocator = TBGPUAllocator(self)
     self._setup_gpfifos()
+
+  @staticmethod
+  def _env_or_default(name: str, default: int) -> int:
+    import os
+
+    try:
+      return int(os.getenv(name, str(default)))
+    except ValueError:
+      return default
 
   def is_nvd(self) -> bool:
     return isinstance(self.iface, PCIIface)
@@ -417,12 +535,32 @@ class TBGPUDevice:
     page = self._signal_pages[-1]
     return Signal(page.offset(off - page.va_addr, 16), owner=self)
 
-  def synchronize(self, timeout: int | None = None):
-    self.timeline_signal.wait(self.timeline_value - 1, timeout=timeout)
+  def new_fence(self, value: int = 1) -> Fence:
+    return Fence(self.new_signal(), value)
 
-  def next_timeline(self) -> int:
-    self.timeline_value += 1
-    return self.timeline_value - 1
+  def synchronize(self, timeout: int | None = None):
+    for lane in [*self.compute_lanes, self.dma_lane]:
+      if lane.tail_fence is not None:
+        lane.tail_fence.wait(timeout=timeout)
+
+  def reserve_kernargs(self, lane_index: int, size: int, alignment: int = 1) -> Buffer:
+    return self.compute_lanes[lane_index].reserve_kernargs(size, alignment)
+
+  def ensure_compute_lanes(self, count: int):
+    if not self.multi_lane_enabled:
+      return
+    target = min(max(1, count), self.requested_compute_lane_count)
+    while len(self.compute_lanes) < target:
+      lane = self._create_compute_lane(len(self.compute_lanes))
+      try:
+        self._setup_compute_lane(lane)
+      except RuntimeError:
+        self.requested_compute_lane_count = len(self.compute_lanes)
+        if int(os.getenv("DEBUG", "0")) >= 1:
+          print(f"tbgpu: compute lane {lane.index} setup timed out, staying on {len(self.compute_lanes)} active compute lane(s)")
+        break
+      self.compute_lanes.append(lane)
+      self.compute_lane_count = len(self.compute_lanes)
 
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False):
     notifier = self.iface.alloc(48 << 20, uncached=True)
@@ -437,11 +575,13 @@ class TBGPUDevice:
       engineType=19 if video else 0,
     )
     gpfifo = self.iface.rm_alloc(channel_group, self.iface.gpfifo_class, params)
-    if compute:
+    if compute and not hasattr(self, "debug_compute_obj"):
       self.debug_compute_obj, self.debug_channel = self.iface.rm_alloc(gpfifo, self.iface.compute_class), gpfifo
       self.debugger = self.iface.rm_alloc(
         self.nvdevice, nv_gpu.GT200_DEBUGGER, nv_gpu.NV83DE_ALLOC_PARAMETERS(hAppClient=self.iface.root, hClass3dObject=self.debug_compute_obj)
       )
+    elif compute:
+      self.iface.rm_alloc(gpfifo, self.iface.compute_class)
     else:
       self.iface.rm_alloc(gpfifo, self.iface.dma_class)
     token = self.iface.rm_control(
@@ -453,6 +593,25 @@ class TBGPUDevice:
       token=token,
       gpput=gpfifo_area.cpu_view().view(offset + entries * 8 + getattr(nv_gpu.AmpereAControlGPFifo, "GPPut").offset, fmt="I"),
     )
+
+  def _create_compute_lane(self, index: int) -> ComputeLane:
+    offset = 0 if index == 0 else (index + 1) * self.gpfifo_stride
+    lane = ComputeLane(
+      dev=self,
+      index=index,
+      gpfifo=self._new_gpu_fifo(self.gpfifo_area, self._ctxshare, self.channel_group, offset=offset, entries=0x10000, compute=True),
+      cmdq=RingAllocator(
+        self.iface.alloc(0x200000, cpu_access=True),
+        BumpAllocator(size=0x200000, base=0, wrap=True),
+      ),
+      kernargs=RingAllocator(
+        self.iface.alloc(16 << 20, cpu_access=True),
+        BumpAllocator(size=16 << 20, base=0, wrap=True),
+      ),
+    )
+    lane.cmdq.allocator.base = lane.cmdq.buf.va_addr
+    lane.kernargs.allocator.base = lane.kernargs.buf.va_addr
+    return lane
 
   def _query_gpu_info(self, *reqs):
     nvrs = [
@@ -475,22 +634,39 @@ class TBGPUDevice:
   def _setup_gpfifos(self):
     self.slm_per_thread, self.shader_local_mem = 0, None
     self.shared_mem_window, self.local_mem_window = 0x729400000000, 0x729300000000
-    NVComputeQueue().setup(
-      compute_class=self.iface.compute_class, local_mem_window=self.local_mem_window, shared_mem_window=self.shared_mem_window
-    ).signal(self.timeline_signal, self.next_timeline()).submit(self)
-    NVCopyQueue().wait(self.timeline_signal, self.timeline_value - 1).setup(copy_class=self.iface.dma_class).signal(
-      self.timeline_signal, self.next_timeline()
-    ).submit(self)
+    for lane in self.compute_lanes:
+      self._setup_compute_lane(lane)
+    dma_fence = self.new_fence()
+    NVCopyQueue().setup(copy_class=self.iface.dma_class).signal(dma_fence.signal, dma_fence.value).submit(self.dma_lane)
+    self.dma_lane.record_submission(dma_fence)
     self.synchronize()
+
+  def _setup_compute_lane(self, lane: ComputeLane):
+    fence = self.new_fence()
+    NVComputeQueue().setup(
+      compute_class=self.iface.compute_class,
+      local_mem_window=self.local_mem_window,
+      shared_mem_window=self.shared_mem_window,
+      local_mem=self.shader_local_mem.va_addr if self.shader_local_mem is not None else None,
+      local_mem_tpc_bytes=self.local_mem_tpc_bytes if self.shader_local_mem is not None else None,
+    ).signal(fence.signal, fence.value).submit(lane)
+    lane.record_submission(fence)
+    fence.wait()
 
   def _ensure_has_local_memory(self, required):
     if self.slm_per_thread >= required:
       return
+    self.synchronize()
     self.slm_per_thread = round_up(required, 32)
     bytes_per_tpc = round_up(round_up(self.slm_per_thread * 32, 0x200) * self.max_warps_per_sm * self.num_sm_per_tpc, 0x8000)
+    self.local_mem_tpc_bytes = bytes_per_tpc
     if self.shader_local_mem is not None:
       self.allocator.free(self.shader_local_mem)
     self.shader_local_mem = self.allocator.alloc(round_up(bytes_per_tpc * self.num_tpc_per_gpc * self.num_gpcs, 0x20000))
-    NVComputeQueue().wait(self.timeline_signal, self.timeline_value - 1).setup(
-      local_mem=self.shader_local_mem.va_addr, local_mem_tpc_bytes=bytes_per_tpc
-    ).signal(self.timeline_signal, self.next_timeline()).submit(self)
+    for lane in self.compute_lanes:
+      fence = self.new_fence()
+      NVComputeQueue().setup(local_mem=self.shader_local_mem.va_addr, local_mem_tpc_bytes=bytes_per_tpc).signal(fence.signal, fence.value).submit(
+        lane
+      )
+      lane.record_submission(fence)
+    self.synchronize()

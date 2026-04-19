@@ -109,6 +109,7 @@ def run_matmul(
   dev = init_c_var(cuda.CUdevice, lambda x: _check(cuda.cuDeviceGet(ctypes.byref(x), 0)))
   ctx = init_c_var(cuda.CUcontext, lambda x: _check(cuda.cuCtxCreate_v2(ctypes.byref(x), 0, dev.value)))
   _check(cuda.cuCtxSetCurrent(ctx))
+  stream = init_c_var(cuda.CUstream, lambda x: _check(cuda.cuStreamCreate(ctypes.byref(x), 0)))
 
   module = None
   a_ptr, b_ptr, c_ptr = [cuda.CUdeviceptr() for _ in range(3)]
@@ -127,20 +128,22 @@ def run_matmul(
     _check(cuda.cuMemAlloc_v2(ctypes.byref(b_ptr), b_nbytes))
     _check(cuda.cuMemAlloc_v2(ctypes.byref(c_ptr), c_nbytes))
 
-    _check(cuda.cuMemcpyHtoDAsync_v2(a_ptr, _buffer_ptr(a), a_nbytes, None))
-    _check(cuda.cuMemcpyHtoDAsync_v2(b_ptr, _buffer_ptr(b), b_nbytes, None))
-    _check(cuda.cuMemcpyHtoDAsync_v2(c_ptr, _buffer_ptr(host_out), c_nbytes, None))
+    _check(cuda.cuMemcpyHtoDAsync_v2(a_ptr, _buffer_ptr(a), a_nbytes, stream))
+    _check(cuda.cuMemcpyHtoDAsync_v2(b_ptr, _buffer_ptr(b), b_nbytes, stream))
+    _check(cuda.cuMemcpyHtoDAsync_v2(c_ptr, _buffer_ptr(host_out), c_nbytes, stream))
 
     params, _ = _make_kernel_params(c_ptr.value, a_ptr.value, b_ptr.value, m, n, k, alpha, beta)
     grid = ((n + TILE - 1) // TILE, (m + TILE - 1) // TILE, 1)
     block = (TILE, TILE, 1)
-    _check(cuda.cuLaunchKernel(func, *grid, *block, 0, None, params, None))
-    _check(cuda.cuCtxSynchronize())
+    _check(cuda.cuLaunchKernel(func, *grid, *block, 0, stream, params, None))
+    _check(cuda.cuStreamSynchronize(stream))
     _check(cuda.cuMemcpyDtoH_v2(_buffer_ptr(host_out), c_ptr, c_nbytes))
   finally:
     for ptr in [c_ptr, b_ptr, a_ptr]:
       if ptr.value not in (None, 0):
         cuda.cuMemFree_v2(ptr)
+    if stream.value not in (None, 0):
+      cuda.cuStreamDestroy_v2(stream)
     if module is not None:
       cuda.cuModuleUnload(module)
     cuda.cuCtxDestroy_v2(ctx)

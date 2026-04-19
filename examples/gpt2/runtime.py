@@ -104,6 +104,8 @@ class TBGPUContext:
     self.context = cuda.CUcontext()
     _check(cuda.cuCtxCreate_v2(ctypes.byref(self.context), 0, self.device.value))
     _check(cuda.cuCtxSetCurrent(self.context))
+    self.stream = cuda.CUstream()
+    _check(cuda.cuStreamCreate(ctypes.byref(self.stream), 0))
 
     major = ctypes.c_int()
     minor = ctypes.c_int()
@@ -141,6 +143,9 @@ class TBGPUContext:
         cuda.cuModuleUnload(module)
     self._modules.clear()
     with contextlib.suppress(Exception):
+      if self.stream.value not in (None, 0):
+        cuda.cuStreamDestroy_v2(self.stream)
+    with contextlib.suppress(Exception):
       cuda.cuCtxDestroy_v2(self.context)
 
   def __del__(self):
@@ -149,7 +154,7 @@ class TBGPUContext:
 
   def synchronize(self):
     _check(cuda.cuCtxSetCurrent(self.context))
-    _check(cuda.cuCtxSynchronize())
+    _check(cuda.cuStreamSynchronize(self.stream))
 
   def _load_kernel(self, filename: str, kernel_name: str) -> cuda.CUfunction:
     _check(cuda.cuCtxSetCurrent(self.context))
@@ -181,7 +186,7 @@ class TBGPUContext:
   def upload(self, tensor: torch.Tensor, *, dtype: torch.dtype | None = None, static: bool = False) -> DeviceTensor:
     cpu = _as_cpu_contiguous(tensor, dtype=dtype)
     out = self.empty(tuple(cpu.shape), cpu.dtype, static=static)
-    _check(cuda.cuMemcpyHtoDAsync_v2(out.ptr, cpu.data_ptr(), cpu.numel() * cpu.element_size(), None))
+    _check(cuda.cuMemcpyHtoDAsync_v2(out.ptr, cpu.data_ptr(), cpu.numel() * cpu.element_size(), self.stream))
     self.synchronize()
     return out
 
@@ -211,7 +216,7 @@ class TBGPUContext:
 
   def _launch(self, kernel_name: str, params: list[ctypes._SimpleCData], grid: tuple[int, int, int], block: tuple[int, int, int], shared: int = 0):
     kernel_params = (ctypes.c_void_p * len(params))(*[ctypes.addressof(value) for value in params])
-    _check(cuda.cuLaunchKernel(self._functions[kernel_name], *grid, *block, shared, None, kernel_params, None))
+    _check(cuda.cuLaunchKernel(self._functions[kernel_name], *grid, *block, shared, self.stream, kernel_params, None))
 
   def encoder_forward(self, tokens: torch.Tensor, wte: DeviceTensor, wpe: DeviceTensor) -> DeviceTensor:
     tokens_i32 = _as_cpu_contiguous(tokens.to(dtype=torch.int32, device="cpu"))
