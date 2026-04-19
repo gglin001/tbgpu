@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import array
 import ctypes
-import os
 
 import tbgpu.cuda_compat as cuda
 from tests.vector_add import KERNEL_NAME, VecAddArgs, _buffer_ptr, _check, _make_extra, init_c_var, load_kernel_image
@@ -54,12 +53,12 @@ def _run_wait_event_dependency(func, size: int, block_size: int, d_a, d_b, d_tmp
 
 
 def _run_optional_multi_lane_smoke(func, size: int, block_size: int, d_a, d_b, d_out0, d_out1):
-  if int(os.getenv("TBGPU_ENABLE_MULTI_LANE", "0")) == 0 and int(os.getenv("TBGPU_COMPUTE_LANES", "1")) <= 1:
-    return
-
   stream0 = init_c_var(cuda.CUstream, lambda x: _check(cuda.cuStreamCreate(ctypes.byref(x), 0)))
   stream1 = init_c_var(cuda.CUstream, lambda x: _check(cuda.cuStreamCreate(ctypes.byref(x), 0)))
   try:
+    lane_ids = {cuda._STREAMS[stream0.value].lane_index, cuda._STREAMS[stream1.value].lane_index}
+    if len(lane_ids) <= 1:
+      raise AssertionError(f"expected streams to span multiple compute lanes, got {sorted(lane_ids)}")
     _launch_vector_add(func, size, block_size, d_a.value, d_b.value, d_out0.value, stream0)
     _launch_vector_add(func, size, block_size, d_a.value, d_b.value, d_out1.value, stream1)
     _check(cuda.cuStreamSynchronize(stream0))

@@ -69,6 +69,8 @@ class RingAllocator:
 @dataclass
 class QueueLane:
   dev: "TBGPUDevice"
+  channel_group: int
+  ctxshare: int
   gpfifo: GPFifo
   cmdq: RingAllocator
   tail_fence: Fence | None = None
@@ -424,6 +426,8 @@ class TBGPUAllocator:
   def _transfer(
     self, dest: Buffer, src: Buffer, size: int, src_dev: "TBGPUDevice", dest_dev: "TBGPUDevice", waits: list[Fence] | None = None
   ) -> Fence:
+    # Current runtime only models intra-device transfers. Cross-device copies would
+    # need peer mappings plus cross-device synchronization objects that are not wired up yet.
     if src_dev is not dest_dev:
       raise NotImplementedError("cross-device transfers are not supported in this minimal runtime")
     completion = src_dev.new_fence()
@@ -439,10 +443,7 @@ class TBGPUDevice:
   def __init__(self, ordinal: int = 0):
     self.device_id = ordinal
     self.iface = PCIIface(self, ordinal)
-    enable_multi_lane = int(os.getenv("TBGPU_ENABLE_MULTI_LANE", "0")) == 1
-    configured_lanes = max(1, int(os.getenv("TBGPU_COMPUTE_LANES", "2" if enable_multi_lane else "1")))
-    self.multi_lane_enabled = enable_multi_lane or configured_lanes > 1
-    self.requested_compute_lane_count = configured_lanes if self.multi_lane_enabled else 1
+    self.requested_compute_lane_count = max(1, int(os.getenv("TBGPU_COMPUTE_LANES", "2")))
     self.compute_lane_count = 1
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(
       deviceId=self.iface.gpu_instance, hClientShare=self.iface.root, vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES
@@ -468,39 +469,21 @@ class TBGPUDevice:
       vaSize=0x1FFFFFB000000,
       flags=nv_gpu.NV_VASPACE_ALLOCATION_FLAGS_ENABLE_PAGE_FAULTING | nv_gpu.NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED,
     )
-    vaspace = self.iface.rm_alloc(self.nvdevice, nv_gpu.FERMI_VASPACE_A, vaspace_params)
-    self.iface.setup_vm(vaspace)
-    self.channel_group = self.iface.rm_alloc(
-      self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
-    )
+    self.vaspace = self.iface.rm_alloc(self.nvdevice, nv_gpu.FERMI_VASPACE_A, vaspace_params)
+    self.iface.setup_vm(self.vaspace)
     self.gpfifo_stride = 0x100000
     self.gpfifo_area = self.iface.alloc(
       self.gpfifo_stride * (self.requested_compute_lane_count + 1), contiguous=True, cpu_access=True, force_devmem=True, uncached=False
     )
-    ctxshare = self.iface.rm_alloc(
-      self.channel_group,
-      nv_gpu.FERMI_CONTEXT_SHARE_A,
-      nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC),
-    )
-    self._ctxshare = ctxshare
+    # Multi-lane currently means one independent channel group + ctxshare per compute lane.
+    # Reusing one TSG/subcontext stack across multiple compute lanes would require subcontext-aware
+    # GR context promotion in the runtime, which is not implemented here yet.
     self.compute_lanes: list[ComputeLane] = [self._create_compute_lane(0)]
-    self.dma_lane = QueueLane(
-      dev=self,
-      gpfifo=self._new_gpu_fifo(
-        self.gpfifo_area,
-        ctxshare,
-        self.channel_group,
-        offset=self.gpfifo_stride,
-        entries=0x10000,
-        compute=False,
-      ),
-      cmdq=RingAllocator(
-        self.iface.alloc(0x200000, cpu_access=True),
-        BumpAllocator(size=0x200000, base=0, wrap=True),
-      ),
-    )
-    self.dma_lane.cmdq.allocator.base = self.dma_lane.cmdq.buf.va_addr
-    self.iface.rm_control(self.channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
+    self.channel_group = self.compute_lanes[0].channel_group
+    self._ctxshare = self.compute_lanes[0].ctxshare
+    # The runtime still uses a single DMA lane. Compute work can spread across multiple
+    # lanes, but async copies are serialized through this dedicated copy queue for now.
+    self.dma_lane = self._create_dma_lane()
     self.num_gpcs, self.num_tpc_per_gpc, self.num_sm_per_tpc, self.max_warps_per_sm, self.sm_version = self._query_gpu_info(
       "num_gpcs", "num_tpc_per_gpc", "num_sm_per_tpc", "max_warps_per_sm", "sm_version"
     )
@@ -547,8 +530,6 @@ class TBGPUDevice:
     return self.compute_lanes[lane_index].reserve_kernargs(size, alignment)
 
   def ensure_compute_lanes(self, count: int):
-    if not self.multi_lane_enabled:
-      return
     target = min(max(1, count), self.requested_compute_lane_count)
     while len(self.compute_lanes) < target:
       lane = self._create_compute_lane(len(self.compute_lanes))
@@ -561,6 +542,21 @@ class TBGPUDevice:
         break
       self.compute_lanes.append(lane)
       self.compute_lane_count = len(self.compute_lanes)
+
+  def _alloc_channel_group(self) -> int:
+    return self.iface.rm_alloc(
+      self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
+    )
+
+  def _schedule_channel_group(self, channel_group: int):
+    self.iface.rm_control(channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
+
+  def _alloc_ctxshare(self, channel_group: int) -> int:
+    return self.iface.rm_alloc(
+      channel_group,
+      nv_gpu.FERMI_CONTEXT_SHARE_A,
+      nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=self.vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC),
+    )
 
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False):
     notifier = self.iface.alloc(48 << 20, uncached=True)
@@ -596,10 +592,14 @@ class TBGPUDevice:
 
   def _create_compute_lane(self, index: int) -> ComputeLane:
     offset = 0 if index == 0 else (index + 1) * self.gpfifo_stride
+    channel_group = self._alloc_channel_group()
+    ctxshare = self._alloc_ctxshare(channel_group)
     lane = ComputeLane(
       dev=self,
+      channel_group=channel_group,
+      ctxshare=ctxshare,
       index=index,
-      gpfifo=self._new_gpu_fifo(self.gpfifo_area, self._ctxshare, self.channel_group, offset=offset, entries=0x10000, compute=True),
+      gpfifo=self._new_gpu_fifo(self.gpfifo_area, ctxshare, channel_group, offset=offset, entries=0x10000, compute=True),
       cmdq=RingAllocator(
         self.iface.alloc(0x200000, cpu_access=True),
         BumpAllocator(size=0x200000, base=0, wrap=True),
@@ -611,6 +611,31 @@ class TBGPUDevice:
     )
     lane.cmdq.allocator.base = lane.cmdq.buf.va_addr
     lane.kernargs.allocator.base = lane.kernargs.buf.va_addr
+    self._schedule_channel_group(channel_group)
+    return lane
+
+  def _create_dma_lane(self) -> QueueLane:
+    channel_group = self._alloc_channel_group()
+    ctxshare = self._alloc_ctxshare(channel_group)
+    lane = QueueLane(
+      dev=self,
+      channel_group=channel_group,
+      ctxshare=ctxshare,
+      gpfifo=self._new_gpu_fifo(
+        self.gpfifo_area,
+        ctxshare,
+        channel_group,
+        offset=self.gpfifo_stride,
+        entries=0x10000,
+        compute=False,
+      ),
+      cmdq=RingAllocator(
+        self.iface.alloc(0x200000, cpu_access=True),
+        BumpAllocator(size=0x200000, base=0, wrap=True),
+      ),
+    )
+    lane.cmdq.allocator.base = lane.cmdq.buf.va_addr
+    self._schedule_channel_group(channel_group)
     return lane
 
   def _query_gpu_info(self, *reqs):
