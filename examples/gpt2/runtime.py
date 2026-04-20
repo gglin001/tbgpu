@@ -96,6 +96,8 @@ class TBGPUContext:
     self._closed = False
     self._modules: list[cuda.CUmodule] = []
     self._owned_ptrs: list[cuda.CUdeviceptr] = []
+    self._reusable_ptrs: dict[int, list[cuda.CUdeviceptr]] = {}
+    self._pooled_ptr_values: set[int] = set()
     self._deferred_free: list[DeviceTensor] = []
 
     _check(cuda.cuInit(0))
@@ -173,13 +175,29 @@ class TBGPUContext:
     self._owned_ptrs.append(ptr)
     return ptr
 
+  def _take_reusable_ptr(self, nbytes: int) -> cuda.CUdeviceptr | None:
+    for alloc_nbytes in sorted(self._reusable_ptrs):
+      if alloc_nbytes < nbytes:
+        continue
+      pool = self._reusable_ptrs[alloc_nbytes]
+      if not pool:
+        continue
+      ptr = pool.pop()
+      self._pooled_ptr_values.discard(ptr.value)
+      if not pool:
+        del self._reusable_ptrs[alloc_nbytes]
+      return ptr
+    return None
+
   def empty(self, shape: tuple[int, ...], dtype: torch.dtype, *, alloc_shape: tuple[int, ...] | None = None, static: bool = False) -> DeviceTensor:
     alloc = alloc_shape or shape
+    alloc_nbytes = _shape_numel(alloc) * dtype.itemsize
+    ptr = self._new_ptr(alloc_nbytes) if static else (self._take_reusable_ptr(alloc_nbytes) or self._new_ptr(alloc_nbytes))
     return DeviceTensor(
-      ptr=self._new_ptr(_shape_numel(alloc) * dtype.itemsize),
+      ptr=ptr,
       shape=shape,
       dtype=dtype,
-      alloc_nbytes=_shape_numel(alloc) * dtype.itemsize,
+      alloc_nbytes=alloc_nbytes,
       static=static,
     )
 
@@ -198,9 +216,11 @@ class TBGPUContext:
   def free(self, tensor: DeviceTensor | None):
     if tensor is None or tensor.static:
       return
+    if tensor.ptr.value in self._pooled_ptr_values:
+      return
     if tensor.ptr in self._owned_ptrs:
-      self._owned_ptrs.remove(tensor.ptr)
-      _check(cuda.cuMemFree_v2(tensor.ptr))
+      self._reusable_ptrs.setdefault(tensor.alloc_nbytes, []).append(tensor.ptr)
+      self._pooled_ptr_values.add(tensor.ptr.value)
 
   def defer_free(self, tensor: DeviceTensor | None):
     if tensor is None or tensor.static:
@@ -235,8 +255,7 @@ class TBGPUContext:
       ctypes.c_uint32(channels),
     ]
     self._launch(ENCODER_KERNEL, params, ((total_vec + 255) // 256, 1, 1), (256, 1, 1))
-    self.synchronize()
-    self.free(tokens_gpu)
+    self.defer_free(tokens_gpu)
     return out
 
   def encoder_forward_step(self, token: int, position: int, wte: DeviceTensor, wpe: DeviceTensor) -> DeviceTensor:

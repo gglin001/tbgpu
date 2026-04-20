@@ -235,6 +235,14 @@ class TBGPUGPT:
     with contextlib.suppress(Exception):
       self.close()
 
+  @torch.no_grad()
+  def warmup(self, *, prompt_len: int = 16, decode_steps: int = 1):
+    prompt_len = max(1, min(int(prompt_len), GPT2_BLOCK_SIZE - max(int(decode_steps), 0)))
+    warm_tokens = torch.zeros((1, prompt_len), dtype=torch.long)
+    self._prefill(warm_tokens)
+    for step in range(max(int(decode_steps), 0)):
+      self._decode_step(0, prompt_len + step)
+
   def forward(self, idx: torch.Tensor) -> torch.Tensor:
     return self._prefill(idx)
 

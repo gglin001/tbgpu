@@ -31,6 +31,12 @@ def main():
   parser = argparse.ArgumentParser(description="Compare the TBGPU GPT-2 path against the torch-cpu baseline")
   parser.add_argument("--prompt", type=str, default="The answer to life is")
   parser.add_argument("--count", type=int, default=4, help="number of greedy tokens to generate")
+  parser.add_argument(
+    "--warmup",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="run a GPU warmup pass before measuring latency",
+  )
   args = parser.parse_args()
 
   if not GPT2_WEIGHTS_PATH.exists():
@@ -47,6 +53,8 @@ def main():
 
   runner = TBGPUGPT(model)
   try:
+    if args.warmup:
+      runner.warmup(prompt_len=max(tokens.shape[1], 16), decode_steps=max(args.count - 1, 0))
     with torch.no_grad():
       t0 = time.perf_counter()
       got_logits = runner(tokens)
