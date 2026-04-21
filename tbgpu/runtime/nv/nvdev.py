@@ -206,7 +206,7 @@ class NVDev:
     )
 
   def _alloc_sysmem(self, size: int, vaddr: int = 0, contiguous: bool = False, data: bytes | None = None) -> tuple[MMIOInterface, list[int]]:
-    view, paddrs = self.pci_dev.alloc_sysmem(size, vaddr, contiguous=contiguous)
+    view, _, paddrs = self.pci_dev.alloc_sysmem(size, vaddr, contiguous=contiguous)
     if data is not None:
       view[:size] = data
     return view, paddrs

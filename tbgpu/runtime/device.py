@@ -41,6 +41,31 @@ class Fence:
 
 
 @dataclass
+class TransferStats:
+  h2d_bytes: int = 0
+  h2d_chunks: int = 0
+  d2h_bytes: int = 0
+  d2h_chunks: int = 0
+  d2d_bytes: int = 0
+  d2d_chunks: int = 0
+
+  def reset(self):
+    self.h2d_bytes = self.h2d_chunks = 0
+    self.d2h_bytes = self.d2h_chunks = 0
+    self.d2d_bytes = self.d2d_chunks = 0
+
+  def snapshot(self) -> dict[str, int]:
+    return {
+      "h2d_bytes": self.h2d_bytes,
+      "h2d_chunks": self.h2d_chunks,
+      "d2h_bytes": self.d2h_bytes,
+      "d2h_chunks": self.d2h_chunks,
+      "d2d_bytes": self.d2d_bytes,
+      "d2d_chunks": self.d2d_chunks,
+    }
+
+
+@dataclass
 class GPFifo:
   ring: MMIOInterface
   gpput: MMIOInterface
@@ -360,9 +385,9 @@ class PCIIface:
     size = round_up(size, mmap.PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
     if should_use_sysmem:
       vaddr = self.dev_impl.mm.alloc_vaddr(size, align=mmap.PAGESIZE)
-      memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
-      mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
-      return Buffer(vaddr, size, meta=PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), view=memview, owner=self.dev)
+      memview, paddrs, pages = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
+      mapping = self.dev_impl.mm.map_range(vaddr, size, paddrs, aspace=AddrSpace.SYS, snooped=True, uncached=True)
+      return Buffer(vaddr, size, meta=PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=pages[0]), view=memview, owner=self.dev)
     mapping = self.dev_impl.mm.valloc(size, uncached=uncached, contiguous=cpu_access)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
     return Buffer(mapping.va_addr, size, meta=PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), view=barview, owner=self.dev)
@@ -376,11 +401,52 @@ class PCIIface:
 
 
 class TBGPUAllocator:
-  def __init__(self, dev: "TBGPUDevice", staging_size=(2 << 20), staging_count=2):
+  def __init__(self, dev: "TBGPUDevice", staging_size: int | None = None, staging_count: int | None = None):
     self.dev = dev
-    self.staging = [self.dev.iface.alloc(staging_size, host=True, cpu_access=True) for _ in range(staging_count)]
+    self.staging = self._alloc_staging_pool(staging_size, staging_count)
     self.staging_idx = -1
-    self.staging_fences: list[Fence | None] = [None] * staging_count
+    self.staging_fences: list[Fence | None] = [None] * len(self.staging)
+
+  @staticmethod
+  def _parse_staging_candidates(staging_size: int | None) -> list[int]:
+    if staging_size is not None:
+      return [staging_size]
+    if raw := os.getenv("TBGPU_STAGING_CANDIDATES_MB"):
+      return [max(1, int(tok.strip())) << 20 for tok in raw.split(",") if tok.strip()]
+    return [32 << 20, 16 << 20, 8 << 20, 2 << 20]
+
+  @staticmethod
+  def _staging_depth(size: int, staging_count: int | None) -> int:
+    if staging_count is not None:
+      return staging_count
+    if raw := os.getenv("TBGPU_STAGING_COUNT"):
+      return max(1, int(raw))
+    return 4 if size >= (16 << 20) else (3 if size >= (8 << 20) else 2)
+
+  def _alloc_staging_pool(self, staging_size: int | None, staging_count: int | None) -> list[Buffer]:
+    errors: list[str] = []
+    for size in self._parse_staging_candidates(staging_size):
+      count = self._staging_depth(size, staging_count)
+      staging: list[Buffer] = []
+      try:
+        for _ in range(count):
+          staging.append(self.dev.iface.alloc(size, host=True, cpu_access=True))
+        return staging
+      except Exception as exc:
+        errors.append(f"{size >> 20}MBx{count}: {exc}")
+        for buf in staging:
+          with contextlib.suppress(Exception):
+            self.dev.iface.free(buf.base)
+    raise RuntimeError(f"failed to allocate staging buffers ({'; '.join(errors)})")
+
+  def _copy_lane(self, src: Buffer, dest: Buffer) -> QueueLane:
+    src_aspace = getattr(getattr(src.meta, "mapping", None), "aspace", None)
+    dest_aspace = getattr(getattr(dest.meta, "mapping", None), "aspace", None)
+    if src_aspace is AddrSpace.SYS and dest_aspace is not AddrSpace.SYS:
+      return self.dev.upload_lane
+    if dest_aspace is AddrSpace.SYS and src_aspace is not AddrSpace.SYS:
+      return self.dev.download_lane
+    return self.dev.upload_lane
 
   def alloc(self, size: int, *, cpu_access=False, host=False, uncached=False, contiguous=False, force_devmem=False) -> Buffer:
     return self.dev.iface.alloc(size, cpu_access=cpu_access, host=host, uncached=uncached, contiguous=contiguous, force_devmem=force_devmem)
@@ -397,6 +463,7 @@ class TBGPUAllocator:
   def _copyin(self, dest: Buffer, src: memoryview, waits: list[Fence] | None = None) -> Fence | None:
     waits = [fence for fence in waits or [] if fence is not None]
     completion: Fence | None = None
+    lane = self.dev.upload_lane
     for off in range(0, src.nbytes, self.staging[0].size):
       stage_idx, stage = self._next_staging()
       chunk = min(stage.size, src.nbytes - off)
@@ -405,20 +472,23 @@ class TBGPUAllocator:
       q = NVCopyQueue()
       for fence in waits:
         q.wait(fence.signal, fence.value)
-      q.copy(dest.offset(off, chunk), stage.offset(0, chunk), chunk).signal(completion.signal, completion.value).submit(self.dev.dma_lane)
-      self.dev.dma_lane.record_submission(completion)
+      q.copy(dest.offset(off, chunk), stage.offset(0, chunk), chunk).signal(completion.signal, completion.value).submit(lane)
+      lane.record_submission(completion)
+      self.dev._record_transfer("h2d", chunk)
       self.staging_fences[stage_idx] = completion
       waits = [completion]
     return completion
 
   def _copyout(self, dest: memoryview, src: Buffer):
     self.dev.synchronize()
+    lane = self.dev.download_lane
     for off in range(0, dest.nbytes, self.staging[0].size):
       stage_idx, stage = self._next_staging()
       chunk = min(stage.size, dest.nbytes - off)
       completion = self.dev.new_fence()
-      NVCopyQueue().copy(stage.offset(0, chunk), src.offset(off, chunk), chunk).signal(completion.signal, completion.value).submit(self.dev.dma_lane)
-      self.dev.dma_lane.record_submission(completion)
+      NVCopyQueue().copy(stage.offset(0, chunk), src.offset(off, chunk), chunk).signal(completion.signal, completion.value).submit(lane)
+      lane.record_submission(completion)
+      self.dev._record_transfer("d2h", chunk)
       self.staging_fences[stage_idx] = completion
       completion.wait()
       dest.cast("B")[off : off + chunk] = stage.cpu_view().view(size=chunk, fmt="B")[:]
@@ -434,8 +504,17 @@ class TBGPUAllocator:
     q = NVCopyQueue()
     for fence in waits or []:
       q.wait(fence.signal, fence.value)
-    q.copy(dest, src, size).signal(completion.signal, completion.value).submit(src_dev.dma_lane)
-    src_dev.dma_lane.record_submission(completion)
+    lane = src_dev.allocator._copy_lane(src, dest)
+    src_aspace = getattr(getattr(src.meta, "mapping", None), "aspace", None)
+    dest_aspace = getattr(getattr(dest.meta, "mapping", None), "aspace", None)
+    kind = "d2d"
+    if src_aspace is AddrSpace.SYS and dest_aspace is not AddrSpace.SYS:
+      kind = "h2d"
+    elif dest_aspace is AddrSpace.SYS and src_aspace is not AddrSpace.SYS:
+      kind = "d2h"
+    q.copy(dest, src, size).signal(completion.signal, completion.value).submit(lane)
+    lane.record_submission(completion)
+    src_dev._record_transfer(kind, size)
     return completion
 
 
@@ -473,7 +552,7 @@ class TBGPUDevice:
     self.iface.setup_vm(self.vaspace)
     self.gpfifo_stride = 0x100000
     self.gpfifo_area = self.iface.alloc(
-      self.gpfifo_stride * (self.requested_compute_lane_count + 1), contiguous=True, cpu_access=True, force_devmem=True, uncached=False
+      self.gpfifo_stride * (self.requested_compute_lane_count + 2), contiguous=True, cpu_access=True, force_devmem=True, uncached=False
     )
     # Multi-lane currently means one independent channel group + ctxshare per compute lane.
     # Reusing one TSG/subcontext stack across multiple compute lanes would require subcontext-aware
@@ -481,9 +560,11 @@ class TBGPUDevice:
     self.compute_lanes: list[ComputeLane] = [self._create_compute_lane(0)]
     self.channel_group = self.compute_lanes[0].channel_group
     self._ctxshare = self.compute_lanes[0].ctxshare
-    # The runtime still uses a single DMA lane. Compute work can spread across multiple
-    # lanes, but async copies are serialized through this dedicated copy queue for now.
-    self.dma_lane = self._create_dma_lane()
+    # Keep upload and download traffic on separate copy lanes so USB4 transfers do
+    # not all serialize behind a single queue.
+    self.upload_lane = self._create_dma_lane(slot=1)
+    self.download_lane = self._create_dma_lane(slot=2)
+    self.dma_lane = self.upload_lane
     self.num_gpcs, self.num_tpc_per_gpc, self.num_sm_per_tpc, self.max_warps_per_sm, self.sm_version = self._query_gpu_info(
       "num_gpcs", "num_tpc_per_gpc", "num_sm_per_tpc", "max_warps_per_sm", "sm_version"
     )
@@ -494,6 +575,7 @@ class TBGPUDevice:
     self._signal_pages: list[Buffer] = []
     self._signal_alloc: BumpAllocator | None = None
     self.local_mem_tpc_bytes = 0
+    self.transfer_stats = TransferStats()
     self.allocator = TBGPUAllocator(self)
     self._setup_gpfifos()
 
@@ -522,9 +604,26 @@ class TBGPUDevice:
     return Fence(self.new_signal(), value)
 
   def synchronize(self, timeout: int | None = None):
-    for lane in [*self.compute_lanes, self.dma_lane]:
+    for lane in [*self.compute_lanes, self.upload_lane, self.download_lane]:
       if lane.tail_fence is not None:
         lane.tail_fence.wait(timeout=timeout)
+
+  def _record_transfer(self, kind: str, size: int):
+    if kind == "h2d":
+      self.transfer_stats.h2d_bytes += size
+      self.transfer_stats.h2d_chunks += 1
+    elif kind == "d2h":
+      self.transfer_stats.d2h_bytes += size
+      self.transfer_stats.d2h_chunks += 1
+    else:
+      self.transfer_stats.d2d_bytes += size
+      self.transfer_stats.d2d_chunks += 1
+
+  def reset_transfer_stats(self):
+    self.transfer_stats.reset()
+
+  def snapshot_transfer_stats(self) -> dict[str, int]:
+    return self.transfer_stats.snapshot()
 
   def reserve_kernargs(self, lane_index: int, size: int, alignment: int = 1) -> Buffer:
     return self.compute_lanes[lane_index].reserve_kernargs(size, alignment)
@@ -591,7 +690,7 @@ class TBGPUDevice:
     )
 
   def _create_compute_lane(self, index: int) -> ComputeLane:
-    offset = 0 if index == 0 else (index + 1) * self.gpfifo_stride
+    offset = 0 if index == 0 else (index + 2) * self.gpfifo_stride
     channel_group = self._alloc_channel_group()
     ctxshare = self._alloc_ctxshare(channel_group)
     lane = ComputeLane(
@@ -614,7 +713,7 @@ class TBGPUDevice:
     self._schedule_channel_group(channel_group)
     return lane
 
-  def _create_dma_lane(self) -> QueueLane:
+  def _create_dma_lane(self, slot: int) -> QueueLane:
     channel_group = self._alloc_channel_group()
     ctxshare = self._alloc_ctxshare(channel_group)
     lane = QueueLane(
@@ -625,7 +724,7 @@ class TBGPUDevice:
         self.gpfifo_area,
         ctxshare,
         channel_group,
-        offset=self.gpfifo_stride,
+        offset=slot * self.gpfifo_stride,
         entries=0x10000,
         compute=False,
       ),
@@ -661,9 +760,10 @@ class TBGPUDevice:
     self.shared_mem_window, self.local_mem_window = 0x729400000000, 0x729300000000
     for lane in self.compute_lanes:
       self._setup_compute_lane(lane)
-    dma_fence = self.new_fence()
-    NVCopyQueue().setup(copy_class=self.iface.dma_class).signal(dma_fence.signal, dma_fence.value).submit(self.dma_lane)
-    self.dma_lane.record_submission(dma_fence)
+    for lane in [self.upload_lane, self.download_lane]:
+      dma_fence = self.new_fence()
+      NVCopyQueue().setup(copy_class=self.iface.dma_class).signal(dma_fence.signal, dma_fence.value).submit(lane)
+      lane.record_submission(dma_fence)
     self.synchronize()
 
   def _setup_compute_lane(self, lane: ComputeLane):

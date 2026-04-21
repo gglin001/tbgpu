@@ -81,6 +81,27 @@ class RemotePCIDevice:
   _rpc_count = 0
   _start_time = 0.0
 
+  @classmethod
+  def reset_stats(cls):
+    cls._bulk_sent = 0
+    cls._bulk_recv = 0
+    cls._rpc_count = 0
+    cls._start_time = time.perf_counter()
+
+  @classmethod
+  def snapshot_stats(cls) -> dict[str, float | int]:
+    if cls._start_time == 0.0:
+      cls._start_time = time.perf_counter()
+    elapsed_s = max(time.perf_counter() - cls._start_time, 0.0)
+    return {
+      "bulk_sent": cls._bulk_sent,
+      "bulk_recv": cls._bulk_recv,
+      "rpc_count": cls._rpc_count,
+      "elapsed_s": elapsed_s,
+      "bulk_sent_gbps": ((cls._bulk_sent / elapsed_s) / (1 << 30)) if elapsed_s > 0 else 0.0,
+      "bulk_recv_gbps": ((cls._bulk_recv / elapsed_s) / (1 << 30)) if elapsed_s > 0 else 0.0,
+    }
+
   @staticmethod
   def _recvall(sock: socket.socket, n: int) -> bytes:
     data = b""
@@ -124,7 +145,14 @@ class RemotePCIDevice:
     mapped_size, _, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
     memview = MMIOInterface(FileIOInterface(fd=fd).mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0), mapped_size, fmt="B")
     paddrs_raw = list(itertools.takewhile(lambda pair: pair[1] != 0, zip(memview.view(fmt="Q")[0::2], memview.view(fmt="Q")[1::2])))
-    return memview, [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][: ceildiv(size, 0x1000)]
+    trimmed, remaining = [], ceildiv(size, 0x1000) * 0x1000
+    for paddr, seg_size in paddrs_raw:
+      if remaining <= 0:
+        break
+      chunk = min(seg_size, remaining)
+      trimmed.append((paddr, chunk))
+      remaining -= chunk
+    return memview, trimmed, [p + i for p, seg_size in trimmed for i in range(0, seg_size, 0x1000)]
 
   def reset(self):
     self._rpc(self.sock, self.dev_id, RemoteCmd.RESET)

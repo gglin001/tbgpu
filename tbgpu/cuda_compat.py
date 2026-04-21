@@ -246,6 +246,18 @@ def pti_collect(clear: bool = True) -> list[dict[str, Any]]:
     return records
 
 
+def transfer_stats_reset(device_ordinal: int | None = None):
+  devices = _NV_DEVICE_CACHE.items() if device_ordinal is None else [(device_ordinal, _NV_DEVICE_CACHE[device_ordinal])]
+  for _, device in devices:
+    device.reset_transfer_stats()
+
+
+def transfer_stats_snapshot(device_ordinal: int | None = None) -> dict[int, dict[str, int]] | dict[str, int]:
+  if device_ordinal is not None:
+    return _NV_DEVICE_CACHE[device_ordinal].snapshot_transfer_stats()
+  return {ordinal: device.snapshot_transfer_stats() for ordinal, device in _NV_DEVICE_CACHE.items()}
+
+
 def _new_handle() -> int:
   return next(_HANDLE_COUNTER)
 
